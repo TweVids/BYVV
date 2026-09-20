@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="#121212"
+    android:weightSum="10">
+
+    <!-- TOP HALF (50%): Camera Viewfinder / Preview -->
+    <FrameLayout
+        android:id="@+id/cameraContainer"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="5"
+        android:background="#000000">
+
+        <androidx.camera.view.PreviewView
+            android:id="@+id/viewFinder"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:contentDescription="Camera viewfinder taking picture of surroundings" />
+
+        <!-- High contrast status banner -->
+        <TextView
+            android:id="@+id/cameraStatusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top"
+            android:background="#CC000000"
+            android:padding="12dp"
+            android:textColor="#FFFFFF"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:textAlignment="center"
+            android:text="Camera Active (Tap to Capture / Speak)" />
+    </FrameLayout>
+
+    <!-- BOTTOM HALF (50%): Accessible High-Contrast Conversation Boxes -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="5"
+        android:orientation="vertical"
+        android:padding="12dp"
+        android:weightSum="10">
+
+        <!-- USER TURN BOX -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="4"
+            android:orientation="vertical"
+            android:background="#1E1E1E"
+            android:padding="12dp"
+            android:layout_marginBottom="8dp"
+            android:contentDescription="User speech transcription box">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="BẠN (USER):"
+                android:textColor="#4CAF50"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+
+            <ScrollView
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:layout_marginTop="4dp">
+                <TextView
+                    android:id="@+id/userTurnText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textColor="#FFFFFF"
+                    android:textSize="20sp"
+                    android:text="Nhấn nút hoặc màn hình để nói..." />
+            </ScrollView>
+        </LinearLayout>
+
+        <!-- AI RESPONSE BOX -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="4"
+            android:orientation="vertical"
+            android:background="#1E1E1E"
+            android:padding="12dp"
+            android:layout_marginBottom="8dp"
+            android:contentDescription="AI audio and text response box">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="TRỢ LÝ AI (RESPONSE):"
+                android:textColor="#2196F3"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+
+            <ScrollView
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:layout_marginTop="4dp">
+                <TextView
+                    android:id="@+id/aiTurnText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textColor="#FFFF55"
+                    android:textSize="20sp"
+                    android:text="Đang chờ bạn gửi câu hỏi..." />
+            </ScrollView>
+        </LinearLayout>
+
+        <!-- BIG ACCESSIBLE ACTION BUTTON FOR BLIND USERS -->
+        <Button
+            android:id="@+id/actionBtn"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="2"
+            android:backgroundTint="#FFD600"
+            android:textColor="#000000"
+            android:textSize="22sp"
+            android:textStyle="bold"
+            android:text="CHỤP &amp; HỎI (TAP TO ASK)"
+            android:contentDescription="Nút lớn chụp ảnh và hỏi trợ lý bằng giọng nói" />
+
+    </LinearLayout>
+
+</LinearLayout>

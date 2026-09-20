@@ -1,0 +1,23 @@
+# Python & venv
+venv/
+hf_cache/
+*.pyc
+__pycache__/
+
+# Large models / weights (stored on Hugging Face or device storage)
+*.onnx
+*.safetensors
+*.bin
+*.parquet
+sample_data/
+qwen3.5_base/
+valkeryne_lora/
+tts_stt/
+valkeryne_onnx_int8/*.onnx
+valkeryne_onnx_int8/*.data
+
+# Android Gradle build artifacts
+android_multimodal_app/.gradle/
+android_multimodal_app/build/
+android_multimodal_app/*/build/
+android_multimodal_app/local.properties
