@@ -22,10 +22,10 @@ import java.util.concurrent.TimeUnit
 class GeminiLiveClient(private val context: Context) {
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.SECONDS) // 0 for WebSocket (no read timeout)
         .writeTimeout(30, TimeUnit.SECONDS)
-        .pingInterval(10, TimeUnit.SECONDS)
+        // Note: Do not set aggressive pingInterval as Google Live API manages WebSocket frames server-side
         .build()
 
     private val gson = Gson()
