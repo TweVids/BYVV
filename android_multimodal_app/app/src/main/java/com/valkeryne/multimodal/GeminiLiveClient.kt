@@ -14,6 +14,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
@@ -173,10 +175,8 @@ class GeminiLiveClient(private val context: Context) {
         }
         root.add("generationConfig", genConfig)
 
-        val body = RequestBody.create(
-            MediaType.parse("application/json; charset=utf-8"),
-            gson.toJson(root)
-        )
+        val mediaType = "application/json; charset=utf-8".toMediaType()
+        val body = gson.toJson(root).toRequestBody(mediaType)
 
         val request = Request.Builder()
             .url(url)
@@ -192,12 +192,12 @@ class GeminiLiveClient(private val context: Context) {
 
             override fun onResponse(call: Call, response: Response) {
                 if (!response.isSuccessful) {
-                    val errBody = response.body()?.string() ?: ""
-                    callback?.onError("Lỗi ${response.code()}: $errBody")
+                    val errBody = response.body?.string() ?: ""
+                    callback?.onError("Lỗi ${response.code}: $errBody")
                     return
                 }
 
-                val source = response.body()?.source() ?: return
+                val source = response.body?.source() ?: return
                 var accumulatedText = ""
 
                 try {
