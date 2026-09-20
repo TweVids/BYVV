@@ -2,15 +2,14 @@ package com.valkeryne.multimodal
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
-import android.os.Build
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
+import android.util.Log
 import android.view.MotionEvent
 import android.widget.Button
 import android.widget.TextView
@@ -27,9 +26,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
-import java.io.File
 import java.util.Locale
 
 class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
@@ -47,7 +44,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private var audioRecord: AudioRecord? = null
     private var isRecording = false
     private var recordJob: Job? = null
-    private val audioBuffer = ByteArrayOutputStream()
 
     private val sampleRate = 16000
     private val channelConfig = AudioFormat.CHANNEL_IN_MONO
@@ -83,16 +79,19 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
             override fun onUserTurn(text: String) {
                 runOnUiThread {
-                    userTurnText.text = text
+                    userTurnText.text = "Bạn: $text"
                 }
             }
 
             override fun onAiTurn(text: String, isComplete: Boolean, hasNativeAudio: Boolean) {
                 runOnUiThread {
-                    aiTurnText.text = text
-                    if (isComplete && text.isNotBlank()) {
+                    if (text.isNotBlank()) {
+                        aiTurnText.text = text
+                    }
+                    if (isComplete) {
                         cameraStatusText.text = "Hoàn tất - Giữ nút để hỏi tiếp"
-                        if (!hasNativeAudio) {
+                        // Fallback to TTS only if native 24kHz audio was not streamed
+                        if (!hasNativeAudio && text.isNotBlank()) {
                             speakOut(text)
                         }
                     }
@@ -149,7 +148,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         } else {
             cameraStatusText.text = "Mô hình: $model"
             aiTurnText.text = "Sẵn sàng. Giữ nút màu vàng để nói & chụp ảnh."
-            // Pre-connect WebSocket session for instant zero-latency conversation
             geminiClient.ensureConnected {}
         }
     }
@@ -168,18 +166,36 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         holdToSpeakBtn.text = "🔴 ĐANG LẮNG NGHE... (THẢ ĐỂ DỪNG)"
         holdToSpeakBtn.backgroundTintList = ContextCompat.getColorStateList(this, android.R.color.holo_red_dark)
-        userTurnText.text = "Đang truyền giọng nói & hình ảnh trực tiếp đến Gemini..."
+        userTurnText.text = "Đang lắng nghe..."
         aiTurnText.text = "Gemini Live đang lắng nghe..."
         cameraStatusText.text = "Đang thu âm & truyền thời gian thực..."
 
-        // Ensure session is connected, capture frame and stream audio immediately
+        // Ensure session is connected
         geminiClient.ensureConnected {
-            // Capture and stream camera frame at the start of turn
-            val bitmap = viewFinder.bitmap
-            bitmap?.let { bmp ->
-                val stream = ByteArrayOutputStream()
-                bmp.compress(Bitmap.CompressFormat.JPEG, 75, stream)
-                geminiClient.sendCameraFrame(stream.toByteArray())
+            // Capture and scale camera frame in background thread to avoid freezing UI
+            val bmp = viewFinder.bitmap
+            if (bmp != null) {
+                lifecycleScope.launch(Dispatchers.IO) {
+                    try {
+                        val maxDim = 1024
+                        val scaled = if (bmp.width > maxDim || bmp.height > maxDim) {
+                            val ratio = maxDim.toFloat() / maxOf(bmp.width, bmp.height)
+                            Bitmap.createScaledBitmap(
+                                bmp,
+                                (bmp.width * ratio).toInt(),
+                                (bmp.height * ratio).toInt(),
+                                true
+                            )
+                        } else {
+                            bmp
+                        }
+                        val stream = ByteArrayOutputStream()
+                        scaled.compress(Bitmap.CompressFormat.JPEG, 70, stream)
+                        geminiClient.sendCameraFrame(stream.toByteArray())
+                    } catch (e: Exception) {
+                        Log.e("MainActivity", "Error capturing camera frame: ${e.message}")
+                    }
+                }
             }
         }
 
@@ -201,20 +217,40 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun startRecordingAudio() {
         try {
             val minBuf = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
-            audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
+            val bufferSize = maxOf(minBuf * 2, 6400)
+
+            // Try VOICE_RECOGNITION first, fallback to MIC
+            var record = AudioRecord(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
                 sampleRate,
                 channelConfig,
                 audioFormat,
-                minBuf * 2
+                bufferSize
             )
 
+            if (record.state != AudioRecord.STATE_INITIALIZED) {
+                record.release()
+                record = AudioRecord(
+                    MediaRecorder.AudioSource.MIC,
+                    sampleRate,
+                    channelConfig,
+                    audioFormat,
+                    bufferSize
+                )
+            }
+
+            if (record.state != AudioRecord.STATE_INITIALIZED) {
+                Log.e("MainActivity", "AudioRecord initialization failed!")
+                Toast.makeText(this, "Không thể khởi tạo micro!", Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            audioRecord = record
             audioRecord?.startRecording()
             isRecording = true
 
             recordJob = lifecycleScope.launch(Dispatchers.IO) {
-                // Stream 3200 bytes (~100ms chunks) directly in real-time
-                val buffer = ByteArray(3200)
+                val buffer = ByteArray(3200) // 100ms at 16kHz 16-bit mono
                 while (isRecording && isActive) {
                     val read = audioRecord?.read(buffer, 0, buffer.size) ?: 0
                     if (read > 0) {
@@ -225,6 +261,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
         } catch (e: Exception) {
             isRecording = false
+            Log.e("MainActivity", "AudioRecord start error: ${e.message}", e)
             Toast.makeText(this, "Lỗi ghi âm: ${e.message}", Toast.LENGTH_SHORT).show()
         }
     }
@@ -237,65 +274,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             audioRecord = null
             recordJob?.cancel()
         } catch (e: Exception) {}
-    }
-
-    private fun createWavFile(pcmData: ByteArray, sampleRate: Int): ByteArray {
-        val totalAudioLen = pcmData.size.toLong()
-        val totalDataLen = totalAudioLen + 36
-        val longSampleRate = sampleRate.toLong()
-        val channels = 1
-        val byteRate = 16 * sampleRate * channels / 8
-
-        val header = ByteArray(44)
-        header[0] = 'R'.code.toByte()
-        header[1] = 'I'.code.toByte()
-        header[2] = 'F'.code.toByte()
-        header[3] = 'F'.code.toByte()
-        header[4] = (totalDataLen and 0xff).toByte()
-        header[5] = (totalDataLen shr 8 and 0xff).toByte()
-        header[6] = (totalDataLen shr 16 and 0xff).toByte()
-        header[7] = (totalDataLen shr 24 and 0xff).toByte()
-        header[8] = 'W'.code.toByte()
-        header[9] = 'A'.code.toByte()
-        header[10] = 'V'.code.toByte()
-        header[11] = 'E'.code.toByte()
-        header[12] = 'f'.code.toByte()
-        header[13] = 'm'.code.toByte()
-        header[14] = 't'.code.toByte()
-        header[15] = ' '.code.toByte()
-        header[16] = 16
-        header[17] = 0
-        header[18] = 0
-        header[19] = 0
-        header[20] = 1 // PCM
-        header[21] = 0
-        header[22] = channels.toByte()
-        header[23] = 0
-        header[24] = (longSampleRate and 0xff).toByte()
-        header[25] = (longSampleRate shr 8 and 0xff).toByte()
-        header[26] = (longSampleRate shr 16 and 0xff).toByte()
-        header[27] = (longSampleRate shr 24 and 0xff).toByte()
-        header[28] = (byteRate and 0xff).toByte()
-        header[29] = (byteRate shr 8 and 0xff).toByte()
-        header[30] = (byteRate shr 16 and 0xff).toByte()
-        header[31] = (byteRate shr 24 and 0xff).toByte()
-        header[32] = (channels * 16 / 8).toByte()
-        header[33] = 0
-        header[34] = 16
-        header[35] = 0
-        header[36] = 'd'.code.toByte()
-        header[37] = 'a'.code.toByte()
-        header[38] = 't'.code.toByte()
-        header[39] = 'a'.code.toByte()
-        header[40] = (totalAudioLen and 0xff).toByte()
-        header[41] = (totalAudioLen shr 8 and 0xff).toByte()
-        header[42] = (totalAudioLen shr 16 and 0xff).toByte()
-        header[43] = (totalAudioLen shr 24 and 0xff).toByte()
-
-        val out = ByteArrayOutputStream()
-        out.write(header)
-        out.write(pcmData)
-        return out.toByteArray()
     }
 
     private fun startCamera() {

@@ -59,7 +59,7 @@ class GeminiLiveClient(private val context: Context) {
             audioTrack = AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build()
                 )
@@ -70,7 +70,7 @@ class GeminiLiveClient(private val context: Context) {
                         .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                         .build()
                 )
-                .setBufferSizeInBytes(minBufSize * 4)
+                .setBufferSizeInBytes(maxOf(minBufSize * 4, 9600))
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
             audioTrack?.play()
@@ -80,7 +80,11 @@ class GeminiLiveClient(private val context: Context) {
     private fun playPcmChunk(pcmData: ByteArray) {
         try {
             initAudioTrack()
-            audioTrack?.write(pcmData, 0, pcmData.size)
+            val track = audioTrack ?: return
+            if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                track.play()
+            }
+            track.write(pcmData, 0, pcmData.size)
         } catch (e: Exception) {
             Log.e("GeminiLiveClient", "Error playing PCM audio: ${e.message}")
         }
@@ -141,20 +145,17 @@ class GeminiLiveClient(private val context: Context) {
                 callback?.onConnected()
                 callback?.onThinkingStatus("Đã kết nối! Đang gửi Setup cấu hình...")
 
-                // Construct BidiGenerateContentSetup message
                 val setupRoot = JsonObject()
                 val setupObj = JsonObject()
                 setupObj.addProperty("model", "models/$model")
 
                 val genConfig = JsonObject()
                 val modalities = JsonArray()
-                // Live models strictly require responseModalities = ["AUDIO"]
                 modalities.add("AUDIO")
                 genConfig.add("responseModalities", modalities)
 
-                // Model-specific thinking configuration verified against API:
+                // Model-specific thinking configuration
                 if (model.contains("extended-thinking")) {
-                    // gemini-3.8-live-extended-thinking REQUIRES thinkingLevel: "LOW", "MEDIUM", or "HIGH"
                     val level = when {
                         thinkingBudget >= 8192 -> "HIGH"
                         thinkingBudget >= 4096 -> "MEDIUM"
@@ -164,14 +165,16 @@ class GeminiLiveClient(private val context: Context) {
                     thinkingConfig.addProperty("thinkingLevel", level)
                     genConfig.add("thinkingConfig", thinkingConfig)
                 } else if (model.contains("2.5") && thinkingBudget > 0) {
-                    // gemini-2.5-flash-native-audio supports thinkingBudget
                     val thinkingConfig = JsonObject()
                     thinkingConfig.addProperty("thinkingBudget", thinkingBudget)
                     genConfig.add("thinkingConfig", thinkingConfig)
                 }
-                // Note: gemini-3.8-live and gemini-3.1-flash-live-preview reject thinkingConfig, so do not include
 
                 setupObj.add("generationConfig", genConfig)
+
+                // Enable real-time speech transcription for both user input and AI output
+                setupObj.add("inputAudioTranscription", JsonObject())
+                setupObj.add("outputAudioTranscription", JsonObject())
 
                 val sysInstruction = JsonObject()
                 val sysParts = JsonArray()
@@ -247,6 +250,7 @@ class GeminiLiveClient(private val context: Context) {
                                             hasReceivedNativeAudioInTurn = true
                                             val pcmBytes = Base64.decode(b64, Base64.DEFAULT)
                                             playPcmChunk(pcmBytes)
+                                            callback?.onThinkingStatus("Gemini đang trả lời...")
                                         }
                                     }
                                 }
@@ -286,7 +290,6 @@ class GeminiLiveClient(private val context: Context) {
 
     /**
      * Send camera image frame in real-time over WebSocket
-     * Format: {"realtimeInput": {"video": {"data": "base64...", "mimeType": "image/jpeg"}}}
      */
     fun sendCameraFrame(imageBytes: ByteArray) {
         val ws = liveWebSocket ?: return
@@ -309,7 +312,6 @@ class GeminiLiveClient(private val context: Context) {
 
     /**
      * Stream real-time microphone PCM audio chunk (16kHz 16-bit little endian)
-     * Format: {"realtimeInput": {"audio": {"data": "base64...", "mimeType": "audio/pcm;rate=16000"}}}
      */
     fun sendRealtimeAudioChunk(pcmChunk: ByteArray) {
         val ws = liveWebSocket ?: return
@@ -328,7 +330,6 @@ class GeminiLiveClient(private val context: Context) {
 
     /**
      * Notify Gemini that user has finished speaking and trigger response.
-     * Format: {"clientContent": {"turns": [{"role": "user", "parts": []}], "turnComplete": true}}
      */
     fun finishUserTurn() {
         val ws = liveWebSocket ?: return
