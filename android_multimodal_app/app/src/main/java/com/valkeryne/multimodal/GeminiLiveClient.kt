@@ -14,7 +14,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import okhttp3.*
-import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 class GeminiLiveClient(private val context: Context) {
@@ -134,6 +133,8 @@ class GeminiLiveClient(private val context: Context) {
                 callback?.onThinkingStatus("Đã kết nối! Đang gửi Setup cấu hình...")
 
                 // Send BidiGenerateContentSetup message
+                // Format per Google docs: setup.model, setup.generationConfig.responseModalities,
+                // setup.systemInstruction
                 val setupRoot = JsonObject()
                 val setupObj = JsonObject()
                 setupObj.addProperty("model", "models/$model")
@@ -141,13 +142,12 @@ class GeminiLiveClient(private val context: Context) {
                 val genConfig = JsonObject()
                 val modalities = JsonArray()
                 modalities.add("AUDIO")
-                modalities.add("TEXT")
                 genConfig.add("responseModalities", modalities)
 
                 if (thinkingBudget > 0) {
                     val thinkingConfig = JsonObject()
-                    thinkingConfig.addProperty("thinking_budget", thinkingBudget)
-                    genConfig.add("thinking_config", thinkingConfig)
+                    thinkingConfig.addProperty("thinkingBudget", thinkingBudget)
+                    genConfig.add("thinkingConfig", thinkingConfig)
                 }
                 setupObj.add("generationConfig", genConfig)
 
@@ -160,10 +160,14 @@ class GeminiLiveClient(private val context: Context) {
                 setupObj.add("systemInstruction", sysInstruction)
 
                 setupRoot.add("setup", setupObj)
-                webSocket.send(gson.toJson(setupRoot))
+
+                val setupJson = gson.toJson(setupRoot)
+                Log.d("GeminiLiveClient", "Sending setup: $setupJson")
+                webSocket.send(setupJson)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                Log.d("GeminiLiveClient", "Received message: ${text.take(500)}")
                 try {
                     val root = gson.fromJson(text, JsonObject::class.java)
 
@@ -178,6 +182,26 @@ class GeminiLiveClient(private val context: Context) {
                     // 2. Server Content stream
                     if (root.has("serverContent")) {
                         val serverContent = root.getAsJsonObject("serverContent")
+
+                        // Handle input transcription (what the user said)
+                        if (serverContent.has("inputTranscription")) {
+                            val inputTranscription = serverContent.getAsJsonObject("inputTranscription")
+                            val transcribedText = inputTranscription.get("text")?.asString ?: ""
+                            if (transcribedText.isNotBlank()) {
+                                callback?.onUserTurn(transcribedText)
+                            }
+                        }
+
+                        // Handle output transcription (what Gemini said)
+                        if (serverContent.has("outputTranscription")) {
+                            val outputTranscription = serverContent.getAsJsonObject("outputTranscription")
+                            val transcribedText = outputTranscription.get("text")?.asString ?: ""
+                            if (transcribedText.isNotBlank()) {
+                                currentTurnText += transcribedText
+                                callback?.onAiTurn(currentTurnText, false)
+                            }
+                        }
+
                         if (serverContent.has("modelTurn")) {
                             val modelTurn = serverContent.getAsJsonObject("modelTurn")
                             val parts = modelTurn.getAsJsonArray("parts")
@@ -214,7 +238,7 @@ class GeminiLiveClient(private val context: Context) {
                         }
                     }
                 } catch (e: Exception) {
-                    Log.e("GeminiLiveClient", "Error parsing WebSocket message: ${e.message}")
+                    Log.e("GeminiLiveClient", "Error parsing WebSocket message: ${e.message}", e)
                 }
             }
 
@@ -222,12 +246,14 @@ class GeminiLiveClient(private val context: Context) {
                 isConnected = false
                 isSessionSetupComplete = false
                 val errMsg = response?.body?.string() ?: t.message ?: "Mất kết nối"
+                Log.e("GeminiLiveClient", "WebSocket failure: $errMsg", t)
                 callback?.onError("Lỗi Live: $errMsg")
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 isConnected = false
                 isSessionSetupComplete = false
+                Log.d("GeminiLiveClient", "WebSocket closed: code=$code reason=$reason")
                 callback?.onDisconnected(reason)
             }
         })
@@ -235,6 +261,7 @@ class GeminiLiveClient(private val context: Context) {
 
     /**
      * Send camera image frame in real-time over WebSocket
+     * Per Google docs: {"realtimeInput": {"video": {"data": "base64...", "mimeType": "image/jpeg"}}}
      */
     fun sendCameraFrame(imageBytes: ByteArray) {
         val ws = liveWebSocket ?: return
@@ -243,20 +270,21 @@ class GeminiLiveClient(private val context: Context) {
         scope.launch {
             val root = JsonObject()
             val realtimeInput = JsonObject()
-            val mediaChunks = JsonArray()
-            val chunk = JsonObject()
-            chunk.addProperty("mimeType", "image/jpeg")
-            chunk.addProperty("data", Base64.encodeToString(imageBytes, Base64.NO_WRAP))
-            mediaChunks.add(chunk)
-            realtimeInput.add("mediaChunks", mediaChunks)
+            val video = JsonObject()
+            video.addProperty("data", Base64.encodeToString(imageBytes, Base64.NO_WRAP))
+            video.addProperty("mimeType", "image/jpeg")
+            realtimeInput.add("video", video)
             root.add("realtimeInput", realtimeInput)
 
-            ws.send(gson.toJson(root))
+            val json = gson.toJson(root)
+            Log.d("GeminiLiveClient", "Sending video frame (${imageBytes.size} bytes)")
+            ws.send(json)
         }
     }
 
     /**
      * Stream real-time microphone PCM audio chunk (16kHz 16-bit little endian)
+     * Per Google docs: {"realtimeInput": {"audio": {"data": "base64...", "mimeType": "audio/pcm;rate=16000"}}}
      */
     fun sendRealtimeAudioChunk(pcmChunk: ByteArray) {
         val ws = liveWebSocket ?: return
@@ -264,19 +292,18 @@ class GeminiLiveClient(private val context: Context) {
 
         val root = JsonObject()
         val realtimeInput = JsonObject()
-        val mediaChunks = JsonArray()
-        val chunk = JsonObject()
-        chunk.addProperty("mimeType", "audio/pcm;rate=16000")
-        chunk.addProperty("data", Base64.encodeToString(pcmChunk, Base64.NO_WRAP))
-        mediaChunks.add(chunk)
-        realtimeInput.add("mediaChunks", mediaChunks)
+        val audio = JsonObject()
+        audio.addProperty("data", Base64.encodeToString(pcmChunk, Base64.NO_WRAP))
+        audio.addProperty("mimeType", "audio/pcm;rate=16000")
+        realtimeInput.add("audio", audio)
         root.add("realtimeInput", realtimeInput)
 
         ws.send(gson.toJson(root))
     }
 
     /**
-     * Notify Gemini that user has finished speaking
+     * Notify Gemini that user has finished speaking.
+     * Per Google docs: {"clientContent": {"turns": [{"role": "user", "parts": []}], "turnComplete": true}}
      */
     fun finishUserTurn() {
         val ws = liveWebSocket ?: return
@@ -294,7 +321,9 @@ class GeminiLiveClient(private val context: Context) {
             clientContent.addProperty("turnComplete", true)
             root.add("clientContent", clientContent)
 
-            ws.send(gson.toJson(root))
+            val json = gson.toJson(root)
+            Log.d("GeminiLiveClient", "Sending finishUserTurn: $json")
+            ws.send(json)
             callback?.onThinkingStatus("Đang chờ Gemini phản hồi...")
         }
     }
