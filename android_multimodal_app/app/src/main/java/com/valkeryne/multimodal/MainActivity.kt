@@ -27,6 +27,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private lateinit var actionBtn: Button
     private lateinit var cameraStatusText: TextView
     private var tts: TextToSpeech? = null
+    private lateinit var modelDir: File
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -40,7 +41,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         tts = TextToSpeech(this, this)
 
-        val modelDir = getExternalFilesDir(null) ?: filesDir
+        modelDir = getExternalFilesDir(null) ?: filesDir
         engine = ValkeryneMultimodalEngine(this, modelDir)
 
         if (allPermissionsGranted()) {
@@ -53,13 +54,44 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             )
         }
 
+        // Check if models need to be downloaded
+        checkAndDownloadModels()
+
         actionBtn.setOnClickListener {
-            runAccessibleInference(modelDir)
+            runAccessibleInference()
         }
 
-        // Tap camera area also triggers capture for accessibility
         viewFinder.setOnClickListener {
-            runAccessibleInference(modelDir)
+            runAccessibleInference()
+        }
+    }
+
+    private fun checkAndDownloadModels() {
+        if (!ModelDownloader.areModelsDownloaded(modelDir)) {
+            actionBtn.isEnabled = false
+            cameraStatusText.text = "Checking and downloading AI models..."
+            aiTurnText.text = "Lần đầu khởi động: Đang tải mô hình ONNX từ Hugging Face..."
+
+            lifecycleScope.launch {
+                val success = ModelDownloader.downloadAllModels(modelDir) { _, _, status ->
+                    runOnUiThread {
+                        cameraStatusText.text = status
+                        aiTurnText.text = status
+                    }
+                }
+                if (success) {
+                    cameraStatusText.text = "Models ready - Tap to describe"
+                    aiTurnText.text = "Tải xong mô hình! Nhấn nút để bắt đầu."
+                    actionBtn.isEnabled = true
+                } else {
+                    cameraStatusText.text = "Download failed. Please check internet."
+                    aiTurnText.text = "Lỗi khi tải mô hình. Vui lòng kiểm tra kết nối mạng."
+                }
+            }
+        } else {
+            cameraStatusText.text = "Models ready - Tap to describe"
+            aiTurnText.text = "Đang chờ bạn gửi câu hỏi..."
+            actionBtn.isEnabled = true
         }
     }
 
@@ -74,14 +106,18 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             try {
                 cameraProvider.unbindAll()
                 cameraProvider.bindToLifecycle(this, cameraSelector, preview)
-                cameraStatusText.text = "Camera Active - Tap to describe"
             } catch (exc: Exception) {
                 cameraStatusText.text = "Camera error: ${exc.message}"
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
-    private fun runAccessibleInference(modelDir: File) {
+    private fun runAccessibleInference() {
+        if (!ModelDownloader.areModelsDownloaded(modelDir)) {
+            checkAndDownloadModels()
+            return
+        }
+
         actionBtn.isEnabled = false
         userTurnText.text = "Đang lắng nghe & chụp hình ảnh..."
         aiTurnText.text = "Đang phân tích khung cảnh..."
@@ -108,7 +144,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 aiTurnText.text = response
                 cameraStatusText.text = "Đã hoàn thành"
 
-                // Read out loud for blind user
                 speakOut(response)
 
             } catch (e: Exception) {
