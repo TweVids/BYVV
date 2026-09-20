@@ -25,14 +25,19 @@ class GeminiLiveClient(private val context: Context) {
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
+        .pingInterval(10, TimeUnit.SECONDS)
         .build()
 
     private val gson = Gson()
     private val scope = CoroutineScope(Dispatchers.IO + Job())
 
     private var liveWebSocket: WebSocket? = null
-    private var isLiveSessionReady = false
+    private var isSessionSetupComplete = false
     private var audioTrack: AudioTrack? = null
+
+    // Pending data to send once setup is complete
+    private var pendingImageBytes: ByteArray? = null
+    private var pendingAudioBytes: ByteArray? = null
 
     interface Callback {
         fun onConnected()
@@ -51,7 +56,7 @@ class GeminiLiveClient(private val context: Context) {
 
     private fun initAudioTrack() {
         if (audioTrack == null) {
-            val sampleRate = 24000 // Gemini Live standard output is 24kHz PCM 16-bit
+            val sampleRate = 24000 // Gemini Live standard output is 24kHz PCM mono 16-bit
             val minBufSize = AudioTrack.getMinBufferSize(
                 sampleRate,
                 AudioFormat.CHANNEL_OUT_MONO,
@@ -88,16 +93,11 @@ class GeminiLiveClient(private val context: Context) {
     }
 
     /**
-     * Sends a turn over the Gemini Live Multimodal API.
-     * Complies with official Google Multimodal Live API specifications:
-     * - BidiGenerateContent via WebSockets (wss://generativelanguage.googleapis.com/ws/...BidiGenerateContent)
-     * - Realtime streaming input with media_chunks (audio/pcm and image/jpeg)
-     * - Fallback streaming REST API (streamGenerateContent)
+     * Sends multimodal turn over Google Multimodal Live API WebSocket (BidiGenerateContent)
      */
     fun sendMultimodalTurn(
         imageBytes: ByteArray?,
-        audioBytes: ByteArray?,
-        rawPcmBytes: ByteArray? = null,
+        rawPcmBytes: ByteArray?,
         textPrompt: String? = null
     ) {
         val apiKey = AppPreferences.getApiKey(context)
@@ -110,149 +110,197 @@ class GeminiLiveClient(private val context: Context) {
         }
 
         scope.launch {
-            try {
-                // Execute via BidiGenerateContent WebSocket or streaming REST
-                executeStreamingGenerateContent(apiKey, model, thinkingBudget, imageBytes, audioBytes, textPrompt)
-            } catch (e: Exception) {
-                callback?.onError("Lỗi gửi dữ liệu: ${e.message}")
-            }
+            connectAndSendLiveWebSocket(apiKey, model, thinkingBudget, imageBytes, rawPcmBytes, textPrompt)
         }
     }
 
-    private fun executeStreamingGenerateContent(
+    private fun connectAndSendLiveWebSocket(
         apiKey: String,
         model: String,
         thinkingBudget: Int,
         imageBytes: ByteArray?,
-        audioBytes: ByteArray?,
+        rawPcmBytes: ByteArray?,
         textPrompt: String?
     ) {
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:streamGenerateContent?alt=sse&key=$apiKey"
+        // Close previous socket if any
+        try {
+            liveWebSocket?.close(1000, "New session")
+        } catch (e: Exception) {}
 
-        val root = JsonObject()
-        val contents = JsonArray()
-        val content = JsonObject()
-        content.addProperty("role", "user")
+        isSessionSetupComplete = false
+        pendingImageBytes = imageBytes
+        pendingAudioBytes = rawPcmBytes
 
-        val parts = JsonArray()
+        val wsUrl = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey"
+        val request = Request.Builder().url(wsUrl).build()
 
-        // 1. Image part (JPEG)
-        if (imageBytes != null && imageBytes.isNotEmpty()) {
-            val imgPart = JsonObject()
-            val inlineData = JsonObject()
-            inlineData.addProperty("mime_type", "image/jpeg")
-            inlineData.addProperty("data", Base64.encodeToString(imageBytes, Base64.NO_WRAP))
-            imgPart.add("inline_data", inlineData)
-            parts.add(imgPart)
-        }
+        callback?.onThinkingStatus("Đang kết nối Gemini Live WebSocket...")
 
-        // 2. Audio part (WAV / PCM)
-        if (audioBytes != null && audioBytes.isNotEmpty()) {
-            val audioPart = JsonObject()
-            val inlineData = JsonObject()
-            inlineData.addProperty("mime_type", "audio/wav")
-            inlineData.addProperty("data", Base64.encodeToString(audioBytes, Base64.NO_WRAP))
-            audioPart.add("inline_data", inlineData)
-            parts.add(audioPart)
-        }
+        liveWebSocket = client.newWebSocket(request, object : WebSocketListener() {
+            var accumulatedText = ""
 
-        // 3. User Instruction / System prompt
-        val promptText = textPrompt ?: "Bạn là BYVV - trợ lý khiếm thị trực quan. Hãy nhìn hình ảnh từ camera và nghe câu hỏi, trả lời trực tiếp, rõ ràng, tự nhiên bằng tiếng Việt."
-        val textPart = JsonObject()
-        textPart.addProperty("text", promptText)
-        parts.add(textPart)
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                callback?.onThinkingStatus("Đã kết nối! Đang gửi Setup cấu hình...")
+                
+                // 1. Send BidiGenerateContentSetup message
+                val setupRoot = JsonObject()
+                val setupObj = JsonObject()
+                setupObj.addProperty("model", "models/$model")
 
-        content.add("parts", parts)
-        contents.add(content)
-        root.add("contents", contents)
+                val genConfig = JsonObject()
+                val modalities = JsonArray()
+                modalities.add("AUDIO")
+                modalities.add("TEXT")
+                genConfig.add("responseModalities", modalities)
 
-        // Generation Config & Thinking Budget
-        val genConfig = JsonObject()
-        if (thinkingBudget > 0) {
-            val thinkingConfig = JsonObject()
-            thinkingConfig.addProperty("thinking_budget", thinkingBudget)
-            genConfig.add("thinking_config", thinkingConfig)
-        }
-        root.add("generationConfig", genConfig)
+                if (thinkingBudget > 0) {
+                    val thinkingConfig = JsonObject()
+                    thinkingConfig.addProperty("thinking_budget", thinkingBudget)
+                    genConfig.add("thinking_config", thinkingConfig)
+                }
+                setupObj.add("generationConfig", genConfig)
 
-        val mediaType = "application/json; charset=utf-8".toMediaType()
-        val body = gson.toJson(root).toRequestBody(mediaType)
+                val sysInstruction = JsonObject()
+                val sysParts = JsonArray()
+                val sysPart = JsonObject()
+                sysPart.addProperty("text", textPrompt ?: "Bạn là BYVV - trợ lý khiếm thị trực quan. Hãy nhìn hình ảnh từ camera và nghe câu hỏi, trả lời trực tiếp, rõ ràng, tự nhiên bằng tiếng Việt.")
+                sysParts.add(sysPart)
+                sysInstruction.add("parts", sysParts)
+                setupObj.add("systemInstruction", sysInstruction)
 
-        val request = Request.Builder()
-            .url(url)
-            .post(body)
-            .build()
+                setupRoot.add("setup", setupObj)
 
-        callback?.onThinkingStatus("Đang truyền dữ liệu đến Gemini Live...")
-
-        client.newCall(request).enqueue(object : okhttp3.Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                callback?.onError("Lỗi kết nối Gemini Live: ${e.message}")
+                val setupJson = gson.toJson(setupRoot)
+                webSocket.send(setupJson)
             }
 
-            override fun onResponse(call: Call, response: Response) {
-                if (!response.isSuccessful) {
-                    val errBody = response.body?.string() ?: ""
-                    callback?.onError("Lỗi ${response.code}: $errBody")
-                    return
-                }
-
-                val source = response.body?.source() ?: return
-                var accumulatedText = ""
-
+            override fun onMessage(webSocket: WebSocket, text: String) {
                 try {
-                    while (!source.exhausted()) {
-                        val line = source.readUtf8Line() ?: break
-                        if (line.startsWith("data: ")) {
-                            val jsonStr = line.substring(6).trim()
-                            if (jsonStr.isEmpty() || jsonStr == "[DONE]") continue
+                    val root = gson.fromJson(text, JsonObject::class.java)
 
-                            try {
-                                val obj = gson.fromJson(jsonStr, JsonObject::class.java)
-                                val candidates = obj.getAsJsonArray("candidates")
-                                if (candidates != null && candidates.size() > 0) {
-                                    val candidate = candidates[0].asJsonObject
-                                    val candidateContent = candidate.getAsJsonObject("content")
-                                    val partList = candidateContent?.getAsJsonArray("parts")
+                    // Check setupComplete
+                    if (root.has("setupComplete")) {
+                        isSessionSetupComplete = true
+                        callback?.onThinkingStatus("Đang truyền hình ảnh và âm thanh...")
+                        sendRealtimeMediaChunks(webSocket)
+                        return
+                    }
 
-                                    if (partList != null) {
-                                        for (p in partList) {
-                                            val pObj = p.asJsonObject
-                                            // Handle Live Extended Thinking thoughts
-                                            if (pObj.has("thought") && pObj.get("thought").asBoolean) {
-                                                val thoughtText = pObj.get("text")?.asString ?: ""
-                                                callback?.onThinkingStatus("Đang suy nghĩ: $thoughtText")
-                                            } else if (pObj.has("text")) {
-                                                val chunk = pObj.get("text").asString
-                                                accumulatedText += chunk
-                                                callback?.onAiTurn(accumulatedText, false)
-                                            } else if (pObj.has("inlineData")) {
-                                                // Handle Live Native Audio chunks
-                                                val dataObj = pObj.getAsJsonObject("inlineData")
-                                                val b64 = dataObj.get("data")?.asString
-                                                if (b64 != null) {
-                                                    val rawAudio = Base64.decode(b64, Base64.DEFAULT)
-                                                    playPcmChunk(rawAudio)
-                                                }
-                                            }
+                    // Handle serverContent
+                    if (root.has("serverContent")) {
+                        val serverContent = root.getAsJsonObject("serverContent")
+                        if (serverContent.has("modelTurn")) {
+                            val modelTurn = serverContent.getAsJsonObject("modelTurn")
+                            val parts = modelTurn.getAsJsonArray("parts")
+                            if (parts != null) {
+                                for (p in parts) {
+                                    val pObj = p.asJsonObject
+                                    // 1. Check thought
+                                    if (pObj.has("thought") && pObj.get("thought").asBoolean) {
+                                        val thought = pObj.get("text")?.asString ?: ""
+                                        callback?.onThinkingStatus("Suy nghĩ: $thought")
+                                    } else if (pObj.has("text")) {
+                                        // 2. Text response
+                                        val chunk = pObj.get("text").asString
+                                        accumulatedText += chunk
+                                        callback?.onAiTurn(accumulatedText, false)
+                                    } else if (pObj.has("inlineData")) {
+                                        // 3. Native Audio PCM chunk (24kHz)
+                                        val dataObj = pObj.getAsJsonObject("inlineData")
+                                        val b64 = dataObj.get("data")?.asString
+                                        if (b64 != null) {
+                                            val pcmAudio = Base64.decode(b64, Base64.DEFAULT)
+                                            playPcmChunk(pcmAudio)
                                         }
                                     }
                                 }
-                            } catch (parseEx: Exception) {
-                                Log.e("GeminiLiveClient", "Lỗi đọc chunk: ${parseEx.message}")
                             }
                         }
+
+                        if (serverContent.has("turnComplete") && serverContent.get("turnComplete").asBoolean) {
+                            callback?.onAiTurn(accumulatedText, true)
+                        }
                     }
-                    callback?.onAiTurn(accumulatedText, true)
-                } catch (readEx: Exception) {
-                    callback?.onError("Lỗi luồng phản hồi: ${readEx.message}")
+                } catch (e: Exception) {
+                    Log.e("GeminiLiveClient", "Error parsing WebSocket message: ${e.message}")
                 }
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                val errMsg = response?.body?.string() ?: t.message ?: "Mất kết nối"
+                callback?.onError("Lỗi kết nối Live: $errMsg")
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                callback?.onDisconnected(reason)
             }
         })
     }
 
+    private fun sendRealtimeMediaChunks(ws: WebSocket) {
+        val img = pendingImageBytes
+        val pcm = pendingAudioBytes
+
+        // 1. Send Camera Frame as Realtime Input media_chunk
+        if (img != null && img.isNotEmpty()) {
+            val imgRoot = JsonObject()
+            val realtimeInput = JsonObject()
+            val mediaChunks = JsonArray()
+            val chunk = JsonObject()
+            chunk.addProperty("mime_type", "image/jpeg")
+            chunk.addProperty("data", Base64.encodeToString(img, Base64.NO_WRAP))
+            mediaChunks.add(chunk)
+            realtimeInput.add("media_chunks", mediaChunks)
+            imgRoot.add("realtime_input", realtimeInput)
+
+            ws.send(gson.toJson(imgRoot))
+        }
+
+        // 2. Send Audio PCM chunks (16kHz PCM little endian)
+        if (pcm != null && pcm.isNotEmpty()) {
+            // Send in chunks of 4KB (~128ms each)
+            val chunkSize = 4096
+            var offset = 0
+            while (offset < pcm.size) {
+                val len = Math.min(chunkSize, pcm.size - offset)
+                val slice = ByteArray(len)
+                System.arraycopy(pcm, offset, slice, 0, len)
+
+                val audioRoot = JsonObject()
+                val realtimeInput = JsonObject()
+                val mediaChunks = JsonArray()
+                val chunk = JsonObject()
+                chunk.addProperty("mime_type", "audio/pcm;rate=16000")
+                chunk.addProperty("data", Base64.encodeToString(slice, Base64.NO_WRAP))
+                mediaChunks.add(chunk)
+                realtimeInput.add("media_chunks", mediaChunks)
+                audioRoot.add("realtime_input", realtimeInput)
+
+                ws.send(gson.toJson(audioRoot))
+                offset += len
+            }
+        }
+
+        // 3. Mark client turn as completed
+        val turnCompleteRoot = JsonObject()
+        val clientContent = JsonObject()
+        val turns = JsonArray()
+        val turn = JsonObject()
+        turn.addProperty("role", "user")
+        turn.add("parts", JsonArray())
+        turns.add(turn)
+        clientContent.add("turns", turns)
+        clientContent.addProperty("turn_complete", true)
+        turnCompleteRoot.add("client_content", clientContent)
+
+        ws.send(gson.toJson(turnCompleteRoot))
+        callback?.onThinkingStatus("Đang chờ Gemini phản hồi...")
+    }
+
     fun release() {
         try {
+            liveWebSocket?.close(1000, "App closed")
+            liveWebSocket = null
             audioTrack?.stop()
             audioTrack?.release()
             audioTrack = null

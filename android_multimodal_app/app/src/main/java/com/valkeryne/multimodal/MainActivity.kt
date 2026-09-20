@@ -224,7 +224,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             val rawPcm = synchronized(audioBuffer) {
                 audioBuffer.toByteArray()
             }
-            val wavBytes = if (rawPcm.isNotEmpty()) createWavFile(rawPcm, sampleRate) else null
 
             // Capture current camera preview frame
             val bitmap = viewFinder.bitmap
@@ -234,10 +233,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 stream.toByteArray()
             }
 
-            userTurnText.text = if (wavBytes != null) "Đã gửi âm thanh (${wavBytes.size / 1024} KB) + Ảnh camera" else "Đã gửi ảnh camera"
-            aiTurnText.text = "Gemini đang xử lý và phản hồi..."
+            userTurnText.text = if (rawPcm.isNotEmpty()) "Đã gửi âm thanh (${rawPcm.size / 1024} KB) + Ảnh camera" else "Đã gửi ảnh camera"
+            aiTurnText.text = "Gemini Live đang lắng nghe và phản hồi..."
 
-            geminiClient.sendMultimodalTurn(imageBytes, wavBytes)
+            geminiClient.sendMultimodalTurn(imageBytes, rawPcm)
         }
     }
 
