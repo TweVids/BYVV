@@ -19,7 +19,9 @@ import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
 
@@ -38,7 +40,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         override fun onReceive(context: Context?, intent: Intent?) {
             intent?.let {
                 val status = it.getStringExtra(DownloadService.EXTRA_STATUS) ?: ""
-                val percent = it.getIntExtra(DownloadService.EXTRA_PERCENT, 0)
                 val hasSuccess = it.hasExtra(DownloadService.EXTRA_SUCCESS)
 
                 if (hasSuccess) {
@@ -47,10 +48,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         cameraStatusText.text = "Models ready - Tap to describe"
                         aiTurnText.text = "Tải & kiểm tra mô hình thành công! Nhấn nút để bắt đầu."
                         actionBtn.isEnabled = true
+                        actionBtn.text = "CHỤP & HỎI (TAP TO ASK)"
                     } else {
-                        cameraStatusText.text = "Download incomplete. Retrying..."
-                        aiTurnText.text = "Mô hình tải chưa xong hoặc bị lỗi. Nhấn nút để thử lại."
+                        cameraStatusText.text = "Download paused or incomplete"
+                        aiTurnText.text = "Nhấn nút để tiếp tục tải mô hình."
                         actionBtn.isEnabled = true
+                        actionBtn.text = "TIẾP TỤC TẢI (RESUME)"
                     }
                 } else if (status.isNotEmpty()) {
                     cameraStatusText.text = status
@@ -77,23 +80,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         requestNeededPermissions()
 
-        actionBtn.setOnClickListener {
-            if (!ModelDownloader.areModelsDownloadedAndValid(modelDir)) {
-                startBackgroundDownload()
-            } else {
-                runAccessibleInference()
-            }
-        }
-
-        viewFinder.setOnClickListener {
-            if (ModelDownloader.areModelsDownloadedAndValid(modelDir)) {
-                runAccessibleInference()
-            }
-        }
-    }
-
-    override fun onResume() {
-        super.onResume()
         val filter = IntentFilter(DownloadService.BROADCAST_DOWNLOAD_PROGRESS)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(downloadReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -102,28 +88,62 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
 
         checkModelStatus()
+
+        actionBtn.setOnClickListener {
+            lifecycleScope.launch {
+                val isReady = withContext(Dispatchers.IO) {
+                    ModelDownloader.areModelsDownloadedAndValid(modelDir)
+                }
+                if (!isReady) {
+                    startBackgroundDownload()
+                } else {
+                    runAccessibleInference()
+                }
+            }
+        }
+
+        viewFinder.setOnClickListener {
+            lifecycleScope.launch {
+                val isReady = withContext(Dispatchers.IO) {
+                    ModelDownloader.areModelsDownloadedAndValid(modelDir)
+                }
+                if (isReady) {
+                    runAccessibleInference()
+                }
+            }
+        }
     }
 
-    override fun onPause() {
-        super.onPause()
+    override fun onDestroy() {
         try {
             unregisterReceiver(downloadReceiver)
         } catch (e: Exception) {}
+        tts?.stop()
+        tts?.shutdown()
+        super.onDestroy()
     }
 
     private fun checkModelStatus() {
-        lifecycleScope.launch {
+        if (ModelDownloader.isDownloading()) {
+            cameraStatusText.text = "Downloading models in background..."
+            actionBtn.isEnabled = false
+            return
+        }
+
+        lifecycleScope.launch(Dispatchers.IO) {
             val valid = ModelDownloader.areModelsDownloadedAndValid(modelDir)
-            if (valid) {
-                cameraStatusText.text = "Models ready - Tap to describe"
-                aiTurnText.text = "Đang chờ bạn gửi câu hỏi..."
-                actionBtn.isEnabled = true
-                actionBtn.text = "CHỤP & HỎI (TAP TO ASK)"
-            } else {
-                cameraStatusText.text = "Models missing or corrupted. Downloading..."
-                aiTurnText.text = "Lần đầu khởi động: Đang tải & kiểm tra mô hình ONNX trong nền..."
-                actionBtn.text = "TẢI MÔ HÌNH (DOWNLOAD)"
-                startBackgroundDownload()
+            withContext(Dispatchers.Main) {
+                if (valid) {
+                    cameraStatusText.text = "Models ready - Tap to describe"
+                    aiTurnText.text = "Đang chờ bạn gửi câu hỏi..."
+                    actionBtn.isEnabled = true
+                    actionBtn.text = "CHỤP & HỎI (TAP TO ASK)"
+                } else {
+                    cameraStatusText.text = "Models missing. Downloading in queue..."
+                    aiTurnText.text = "Đang tải tuần tự các mô hình ONNX trong nền..."
+                    actionBtn.text = "ĐANG TẢI (DOWNLOADING...)"
+                    startBackgroundDownload()
+                }
             }
         }
     }
@@ -196,12 +216,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         if (status == TextToSpeech.SUCCESS) {
             tts?.language = Locale("vi", "VN")
         }
-    }
-
-    override fun onDestroy() {
-        tts?.stop()
-        tts?.shutdown()
-        super.onDestroy()
     }
 
     private fun requestNeededPermissions() {
