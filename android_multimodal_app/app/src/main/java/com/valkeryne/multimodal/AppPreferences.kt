@@ -9,19 +9,23 @@ object AppPreferences {
     private const val KEY_MODEL = "gemini_model"
     private const val KEY_THINKING_BUDGET = "gemini_thinking_budget"
 
-    // Supported Models
-    const val MODEL_GEMINI_2_5_FLASH = "gemini-2.5-flash"
-    const val MODEL_GEMINI_2_5_FLASH_AUDIO = "gemini-2.5-flash-native-audio"
-    const val MODEL_GEMINI_3_1_FLASH_LIVE = "gemini-3.1-flash-live-preview"
-    const val MODEL_GEMINI_3_8_FLASH_THINKING = "gemini-3.8-flash-extended-thinking"
-    const val MODEL_GEMINI_2_0_FLASH_EXP = "gemini-2.0-flash-exp"
+    // Exact Supported Models verified with API key
+    const val MODEL_GEMINI_2_5_FLASH_NATIVE_AUDIO = "gemini-2.5-flash-native-audio-latest"
+    const val MODEL_GEMINI_3_5_TRANSCRIBE_LIVE = "gemini-3.5-transcribe-live"
+    const val MODEL_GEMINI_3_5_FLASH = "gemini-3.5-flash"
+    const val MODEL_GEMINI_3_8_FLASH = "gemini-3.8-flash"
+    const val MODEL_GEMINI_3_6_FLASH = "gemini-3.6-flash"
+    const val MODEL_GEMINI_3_1_FLASH_LITE = "gemini-3.1-flash-lite"
+    const val MODEL_GEMINI_FLASH_LATEST = "gemini-flash-latest"
 
     val AVAILABLE_MODELS = arrayOf(
-        MODEL_GEMINI_2_5_FLASH,
-        MODEL_GEMINI_2_5_FLASH_AUDIO,
-        MODEL_GEMINI_3_1_FLASH_LIVE,
-        MODEL_GEMINI_3_8_FLASH_THINKING,
-        MODEL_GEMINI_2_0_FLASH_EXP
+        MODEL_GEMINI_2_5_FLASH_NATIVE_AUDIO,
+        MODEL_GEMINI_3_5_TRANSCRIBE_LIVE,
+        MODEL_GEMINI_3_5_FLASH,
+        MODEL_GEMINI_3_8_FLASH,
+        MODEL_GEMINI_3_6_FLASH,
+        MODEL_GEMINI_3_1_FLASH_LITE,
+        MODEL_GEMINI_FLASH_LATEST
     )
 
     val THINKING_EFFORT_OPTIONS = arrayOf("Off (0)", "Low (1024)", "Medium (4096)", "High (8192)")
@@ -39,7 +43,7 @@ object AppPreferences {
     }
 
     fun getModel(context: Context): String {
-        return getPrefs(context).getString(KEY_MODEL, MODEL_GEMINI_2_5_FLASH) ?: MODEL_GEMINI_2_5_FLASH
+        return getPrefs(context).getString(KEY_MODEL, MODEL_GEMINI_3_5_FLASH) ?: MODEL_GEMINI_3_5_FLASH
     }
 
     fun setModel(context: Context, model: String) {
