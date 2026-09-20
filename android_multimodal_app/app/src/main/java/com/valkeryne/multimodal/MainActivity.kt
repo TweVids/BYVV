@@ -147,6 +147,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         } else {
             cameraStatusText.text = "Mô hình: $model"
             aiTurnText.text = "Sẵn sàng. Giữ nút màu vàng để nói & chụp ảnh."
+            // Pre-connect WebSocket session for instant zero-latency conversation
+            geminiClient.ensureConnected {}
         }
     }
 
@@ -159,11 +161,22 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             return
         }
 
-        holdToSpeakBtn.text = "🔴 ĐANG LẮNG NGHE... (THẢ ĐỂ GỬI)"
+        holdToSpeakBtn.text = "🔴 ĐANG LẮNG NGHE... (THẢ ĐỂ DỪNG)"
         holdToSpeakBtn.backgroundTintList = ContextCompat.getColorStateList(this, android.R.color.holo_red_dark)
-        userTurnText.text = "Đang ghi âm giọng nói & chụp ảnh từ camera..."
-        aiTurnText.text = "Đang chuẩn bị gửi..."
-        cameraStatusText.text = "Đang lắng nghe..."
+        userTurnText.text = "Đang truyền giọng nói & hình ảnh trực tiếp đến Gemini..."
+        aiTurnText.text = "Gemini Live đang lắng nghe..."
+        cameraStatusText.text = "Đang thu âm & truyền thời gian thực..."
+
+        // Ensure session is connected, capture frame and stream audio immediately
+        geminiClient.ensureConnected {
+            // Capture and stream camera frame at the start of turn
+            val bitmap = viewFinder.bitmap
+            bitmap?.let { bmp ->
+                val stream = ByteArrayOutputStream()
+                bmp.compress(Bitmap.CompressFormat.JPEG, 75, stream)
+                geminiClient.sendCameraFrame(stream.toByteArray())
+            }
+        }
 
         startRecordingAudio()
     }
@@ -173,9 +186,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         holdToSpeakBtn.text = "🎤 GIỮ ĐỂ NÓI (HOLD TO SPEAK)"
         holdToSpeakBtn.backgroundTintList = ContextCompat.getColorStateList(this, android.R.color.holo_orange_light)
-        cameraStatusText.text = "Đang gửi ảnh & âm thanh đến Gemini..."
+        cameraStatusText.text = "Đã gửi câu hỏi. Đang nhận phản hồi..."
 
-        stopRecordingAndSend()
+        stopRecordingAudio()
+        geminiClient.finishUserTurn()
     }
 
     @SuppressLint("MissingPermission")
@@ -190,18 +204,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 minBuf * 2
             )
 
-            audioBuffer.reset()
             audioRecord?.startRecording()
             isRecording = true
 
             recordJob = lifecycleScope.launch(Dispatchers.IO) {
-                val buffer = ByteArray(1024)
+                // Stream 3200 bytes (~100ms chunks) directly in real-time
+                val buffer = ByteArray(3200)
                 while (isRecording && isActive) {
                     val read = audioRecord?.read(buffer, 0, buffer.size) ?: 0
                     if (read > 0) {
-                        synchronized(audioBuffer) {
-                            audioBuffer.write(buffer, 0, read)
-                        }
+                        val chunk = if (read == buffer.size) buffer else buffer.copyOf(read)
+                        geminiClient.sendRealtimeAudioChunk(chunk)
                     }
                 }
             }
@@ -211,7 +224,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-    private fun stopRecordingAndSend() {
+    private fun stopRecordingAudio() {
         isRecording = false
         try {
             audioRecord?.stop()
@@ -219,25 +232,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             audioRecord = null
             recordJob?.cancel()
         } catch (e: Exception) {}
-
-        lifecycleScope.launch {
-            val rawPcm = synchronized(audioBuffer) {
-                audioBuffer.toByteArray()
-            }
-
-            // Capture current camera preview frame
-            val bitmap = viewFinder.bitmap
-            val imageBytes = bitmap?.let { bmp ->
-                val stream = ByteArrayOutputStream()
-                bmp.compress(Bitmap.CompressFormat.JPEG, 80, stream)
-                stream.toByteArray()
-            }
-
-            userTurnText.text = if (rawPcm.isNotEmpty()) "Đã gửi âm thanh (${rawPcm.size / 1024} KB) + Ảnh camera" else "Đã gửi ảnh camera"
-            aiTurnText.text = "Gemini Live đang lắng nghe và phản hồi..."
-
-            geminiClient.sendMultimodalTurn(imageBytes, rawPcm)
-        }
     }
 
     private fun createWavFile(pcmData: ByteArray, sampleRate: Int): ByteArray {

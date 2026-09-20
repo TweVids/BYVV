@@ -14,8 +14,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import okhttp3.*
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
@@ -23,9 +21,8 @@ class GeminiLiveClient(private val context: Context) {
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.SECONDS) // 0 for WebSocket (no read timeout)
+        .readTimeout(0, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
-        // Note: Do not set aggressive pingInterval as Google Live API manages WebSocket frames server-side
         .build()
 
     private val gson = Gson()
@@ -33,11 +30,8 @@ class GeminiLiveClient(private val context: Context) {
 
     private var liveWebSocket: WebSocket? = null
     private var isSessionSetupComplete = false
+    private var isConnected = false
     private var audioTrack: AudioTrack? = null
-
-    // Pending data to send once setup is complete
-    private var pendingImageBytes: ByteArray? = null
-    private var pendingAudioBytes: ByteArray? = null
 
     interface Callback {
         fun onConnected()
@@ -56,7 +50,7 @@ class GeminiLiveClient(private val context: Context) {
 
     private fun initAudioTrack() {
         if (audioTrack == null) {
-            val sampleRate = 24000 // Gemini Live standard output is 24kHz PCM mono 16-bit
+            val sampleRate = 24000 // Gemini Live outputs 24kHz PCM mono 16-bit
             val minBufSize = AudioTrack.getMinBufferSize(
                 sampleRate,
                 AudioFormat.CHANNEL_OUT_MONO,
@@ -76,7 +70,7 @@ class GeminiLiveClient(private val context: Context) {
                         .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                         .build()
                 )
-                .setBufferSizeInBytes(minBufSize * 2)
+                .setBufferSizeInBytes(minBufSize * 4)
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
             audioTrack?.play()
@@ -93,56 +87,53 @@ class GeminiLiveClient(private val context: Context) {
     }
 
     /**
-     * Sends multimodal turn over Google Multimodal Live API WebSocket (BidiGenerateContent)
+     * Start/ensure active persistent live session before speaking
      */
-    fun sendMultimodalTurn(
-        imageBytes: ByteArray?,
-        rawPcmBytes: ByteArray?,
-        textPrompt: String? = null
-    ) {
+    fun ensureConnected(onReady: () -> Unit) {
+        if (isConnected && isSessionSetupComplete && liveWebSocket != null) {
+            onReady()
+            return
+        }
+
         val apiKey = AppPreferences.getApiKey(context)
         val model = AppPreferences.getModel(context)
         val thinkingBudget = AppPreferences.getThinkingBudget(context)
 
         if (apiKey.isBlank()) {
-            callback?.onError("Vui lòng nhập API Key trong phần Cài Đặt (Settings)!")
+            callback?.onError("Vui lòng nhập API Key trong phần Cài Đặt!")
             return
         }
 
-        scope.launch {
-            connectAndSendLiveWebSocket(apiKey, model, thinkingBudget, imageBytes, rawPcmBytes, textPrompt)
-        }
+        connectLiveWebSocket(apiKey, model, thinkingBudget, onReady)
     }
 
-    private fun connectAndSendLiveWebSocket(
+    private fun connectLiveWebSocket(
         apiKey: String,
         model: String,
         thinkingBudget: Int,
-        imageBytes: ByteArray?,
-        rawPcmBytes: ByteArray?,
-        textPrompt: String?
+        onReady: (() -> Unit)?
     ) {
-        // Close previous socket if any
         try {
-            liveWebSocket?.close(1000, "New session")
+            liveWebSocket?.close(1000, "Reconnecting")
         } catch (e: Exception) {}
 
+        isConnected = false
         isSessionSetupComplete = false
-        pendingImageBytes = imageBytes
-        pendingAudioBytes = rawPcmBytes
 
         val wsUrl = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey"
         val request = Request.Builder().url(wsUrl).build()
 
-        callback?.onThinkingStatus("Đang kết nối Gemini Live WebSocket...")
+        callback?.onThinkingStatus("Đang kết nối WebSocket Gemini Live...")
 
         liveWebSocket = client.newWebSocket(request, object : WebSocketListener() {
-            var accumulatedText = ""
+            var currentTurnText = ""
 
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                isConnected = true
+                callback?.onConnected()
                 callback?.onThinkingStatus("Đã kết nối! Đang gửi Setup cấu hình...")
-                
-                // 1. Send BidiGenerateContentSetup message
+
+                // Send BidiGenerateContentSetup message
                 val setupRoot = JsonObject()
                 val setupObj = JsonObject()
                 setupObj.addProperty("model", "models/$model")
@@ -163,30 +154,28 @@ class GeminiLiveClient(private val context: Context) {
                 val sysInstruction = JsonObject()
                 val sysParts = JsonArray()
                 val sysPart = JsonObject()
-                sysPart.addProperty("text", textPrompt ?: "Bạn là BYVV - trợ lý khiếm thị trực quan. Hãy nhìn hình ảnh từ camera và nghe câu hỏi, trả lời trực tiếp, rõ ràng, tự nhiên bằng tiếng Việt.")
+                sysPart.addProperty("text", "Bạn là BYVV - trợ lý trực quan cho người khiếm thị. Hãy nhìn camera và lắng nghe người dùng, trả lời súc tích, tự nhiên bằng tiếng Việt.")
                 sysParts.add(sysPart)
                 sysInstruction.add("parts", sysParts)
                 setupObj.add("systemInstruction", sysInstruction)
 
                 setupRoot.add("setup", setupObj)
-
-                val setupJson = gson.toJson(setupRoot)
-                webSocket.send(setupJson)
+                webSocket.send(gson.toJson(setupRoot))
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 try {
                     val root = gson.fromJson(text, JsonObject::class.java)
 
-                    // Check setupComplete
+                    // 1. Setup Complete event
                     if (root.has("setupComplete")) {
                         isSessionSetupComplete = true
-                        callback?.onThinkingStatus("Đang truyền hình ảnh và âm thanh...")
-                        sendRealtimeMediaChunks(webSocket)
+                        callback?.onThinkingStatus("Sẵn sàng! Giữ nút để nói.")
+                        onReady?.invoke()
                         return
                     }
 
-                    // Handle serverContent
+                    // 2. Server Content stream
                     if (root.has("serverContent")) {
                         val serverContent = root.getAsJsonObject("serverContent")
                         if (serverContent.has("modelTurn")) {
@@ -195,30 +184,33 @@ class GeminiLiveClient(private val context: Context) {
                             if (parts != null) {
                                 for (p in parts) {
                                     val pObj = p.asJsonObject
-                                    // 1. Check thought
+                                    // Extended thinking
                                     if (pObj.has("thought") && pObj.get("thought").asBoolean) {
                                         val thought = pObj.get("text")?.asString ?: ""
-                                        callback?.onThinkingStatus("Suy nghĩ: $thought")
+                                        callback?.onThinkingStatus("Đang nghĩ: $thought")
                                     } else if (pObj.has("text")) {
-                                        // 2. Text response
+                                        // Text stream
                                         val chunk = pObj.get("text").asString
-                                        accumulatedText += chunk
-                                        callback?.onAiTurn(accumulatedText, false)
+                                        currentTurnText += chunk
+                                        callback?.onAiTurn(currentTurnText, false)
                                     } else if (pObj.has("inlineData")) {
-                                        // 3. Native Audio PCM chunk (24kHz)
+                                        // Live PCM audio stream (24kHz 16-bit mono)
                                         val dataObj = pObj.getAsJsonObject("inlineData")
                                         val b64 = dataObj.get("data")?.asString
                                         if (b64 != null) {
-                                            val pcmAudio = Base64.decode(b64, Base64.DEFAULT)
-                                            playPcmChunk(pcmAudio)
+                                            val pcmBytes = Base64.decode(b64, Base64.DEFAULT)
+                                            playPcmChunk(pcmBytes)
                                         }
                                     }
                                 }
                             }
                         }
 
+                        // Check turn complete
                         if (serverContent.has("turnComplete") && serverContent.get("turnComplete").asBoolean) {
-                            callback?.onAiTurn(accumulatedText, true)
+                            val finishedText = currentTurnText
+                            currentTurnText = ""
+                            callback?.onAiTurn(finishedText, true)
                         }
                     }
                 } catch (e: Exception) {
@@ -227,74 +219,84 @@ class GeminiLiveClient(private val context: Context) {
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                isConnected = false
+                isSessionSetupComplete = false
                 val errMsg = response?.body?.string() ?: t.message ?: "Mất kết nối"
-                callback?.onError("Lỗi kết nối Live: $errMsg")
+                callback?.onError("Lỗi Live: $errMsg")
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                isConnected = false
+                isSessionSetupComplete = false
                 callback?.onDisconnected(reason)
             }
         })
     }
 
-    private fun sendRealtimeMediaChunks(ws: WebSocket) {
-        val img = pendingImageBytes
-        val pcm = pendingAudioBytes
+    /**
+     * Send camera image frame in real-time over WebSocket
+     */
+    fun sendCameraFrame(imageBytes: ByteArray) {
+        val ws = liveWebSocket ?: return
+        if (!isConnected || !isSessionSetupComplete) return
 
-        // 1. Send Camera Frame as Realtime Input media_chunk
-        if (img != null && img.isNotEmpty()) {
-            val imgRoot = JsonObject()
+        scope.launch {
+            val root = JsonObject()
             val realtimeInput = JsonObject()
             val mediaChunks = JsonArray()
             val chunk = JsonObject()
-            chunk.addProperty("mime_type", "image/jpeg")
-            chunk.addProperty("data", Base64.encodeToString(img, Base64.NO_WRAP))
+            chunk.addProperty("mimeType", "image/jpeg")
+            chunk.addProperty("data", Base64.encodeToString(imageBytes, Base64.NO_WRAP))
             mediaChunks.add(chunk)
-            realtimeInput.add("media_chunks", mediaChunks)
-            imgRoot.add("realtime_input", realtimeInput)
+            realtimeInput.add("mediaChunks", mediaChunks)
+            root.add("realtimeInput", realtimeInput)
 
-            ws.send(gson.toJson(imgRoot))
+            ws.send(gson.toJson(root))
         }
+    }
 
-        // 2. Send Audio PCM chunks (16kHz PCM little endian)
-        if (pcm != null && pcm.isNotEmpty()) {
-            // Send in chunks of 4KB (~128ms each)
-            val chunkSize = 4096
-            var offset = 0
-            while (offset < pcm.size) {
-                val len = Math.min(chunkSize, pcm.size - offset)
-                val slice = ByteArray(len)
-                System.arraycopy(pcm, offset, slice, 0, len)
+    /**
+     * Stream real-time microphone PCM audio chunk (16kHz 16-bit little endian)
+     */
+    fun sendRealtimeAudioChunk(pcmChunk: ByteArray) {
+        val ws = liveWebSocket ?: return
+        if (!isConnected || !isSessionSetupComplete) return
 
-                val audioRoot = JsonObject()
-                val realtimeInput = JsonObject()
-                val mediaChunks = JsonArray()
-                val chunk = JsonObject()
-                chunk.addProperty("mime_type", "audio/pcm;rate=16000")
-                chunk.addProperty("data", Base64.encodeToString(slice, Base64.NO_WRAP))
-                mediaChunks.add(chunk)
-                realtimeInput.add("media_chunks", mediaChunks)
-                audioRoot.add("realtime_input", realtimeInput)
+        val root = JsonObject()
+        val realtimeInput = JsonObject()
+        val mediaChunks = JsonArray()
+        val chunk = JsonObject()
+        chunk.addProperty("mimeType", "audio/pcm;rate=16000")
+        chunk.addProperty("data", Base64.encodeToString(pcmChunk, Base64.NO_WRAP))
+        mediaChunks.add(chunk)
+        realtimeInput.add("mediaChunks", mediaChunks)
+        root.add("realtimeInput", realtimeInput)
 
-                ws.send(gson.toJson(audioRoot))
-                offset += len
-            }
+        ws.send(gson.toJson(root))
+    }
+
+    /**
+     * Notify Gemini that user has finished speaking
+     */
+    fun finishUserTurn() {
+        val ws = liveWebSocket ?: return
+        if (!isConnected || !isSessionSetupComplete) return
+
+        scope.launch {
+            val root = JsonObject()
+            val clientContent = JsonObject()
+            val turns = JsonArray()
+            val turn = JsonObject()
+            turn.addProperty("role", "user")
+            turn.add("parts", JsonArray())
+            turns.add(turn)
+            clientContent.add("turns", turns)
+            clientContent.addProperty("turnComplete", true)
+            root.add("clientContent", clientContent)
+
+            ws.send(gson.toJson(root))
+            callback?.onThinkingStatus("Đang chờ Gemini phản hồi...")
         }
-
-        // 3. Mark client turn as completed
-        val turnCompleteRoot = JsonObject()
-        val clientContent = JsonObject()
-        val turns = JsonArray()
-        val turn = JsonObject()
-        turn.addProperty("role", "user")
-        turn.add("parts", JsonArray())
-        turns.add(turn)
-        clientContent.add("turns", turns)
-        clientContent.addProperty("turn_complete", true)
-        turnCompleteRoot.add("client_content", clientContent)
-
-        ws.send(gson.toJson(turnCompleteRoot))
-        callback?.onThinkingStatus("Đang chờ Gemini phản hồi...")
     }
 
     fun release() {
