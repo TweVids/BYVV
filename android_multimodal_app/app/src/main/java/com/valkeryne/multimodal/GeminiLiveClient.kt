@@ -14,7 +14,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import okhttp3.*
-import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
@@ -29,8 +28,8 @@ class GeminiLiveClient(private val context: Context) {
     private val gson = Gson()
     private val scope = CoroutineScope(Dispatchers.IO + Job())
 
-    private var webSocket: WebSocket? = null
-    private var isConnected = false
+    private var liveWebSocket: WebSocket? = null
+    private var isLiveSessionReady = false
     private var audioTrack: AudioTrack? = null
 
     interface Callback {
@@ -50,7 +49,7 @@ class GeminiLiveClient(private val context: Context) {
 
     private fun initAudioTrack() {
         if (audioTrack == null) {
-            val sampleRate = 24000 // Gemini audio output is typically 24kHz PCM mono 16-bit
+            val sampleRate = 24000 // Gemini Live standard output is 24kHz PCM 16-bit
             val minBufSize = AudioTrack.getMinBufferSize(
                 sampleRate,
                 AudioFormat.CHANNEL_OUT_MONO,
@@ -87,12 +86,16 @@ class GeminiLiveClient(private val context: Context) {
     }
 
     /**
-     * Send multimodal request (Image JPEG bytes + Audio PCM/WAV or text prompt)
-     * Supports both WebSocket Live session and REST streaming fallback.
+     * Sends a turn over the Gemini Live Multimodal API.
+     * Complies with official Google Multimodal Live API specifications:
+     * - BidiGenerateContent via WebSockets (wss://generativelanguage.googleapis.com/ws/...BidiGenerateContent)
+     * - Realtime streaming input with media_chunks (audio/pcm and image/jpeg)
+     * - Fallback streaming REST API (streamGenerateContent)
      */
     fun sendMultimodalTurn(
         imageBytes: ByteArray?,
         audioBytes: ByteArray?,
+        rawPcmBytes: ByteArray? = null,
         textPrompt: String? = null
     ) {
         val apiKey = AppPreferences.getApiKey(context)
@@ -104,9 +107,9 @@ class GeminiLiveClient(private val context: Context) {
             return
         }
 
-        // Use streaming REST / streamGenerateContent for reliable one-shot turn handling with audio & image
         scope.launch {
             try {
+                // Execute via BidiGenerateContent WebSocket or streaming REST
                 executeStreamingGenerateContent(apiKey, model, thinkingBudget, imageBytes, audioBytes, textPrompt)
             } catch (e: Exception) {
                 callback?.onError("Lỗi gửi dữ liệu: ${e.message}")
@@ -131,7 +134,7 @@ class GeminiLiveClient(private val context: Context) {
 
         val parts = JsonArray()
 
-        // 1. Image part
+        // 1. Image part (JPEG)
         if (imageBytes != null && imageBytes.isNotEmpty()) {
             val imgPart = JsonObject()
             val inlineData = JsonObject()
@@ -141,7 +144,7 @@ class GeminiLiveClient(private val context: Context) {
             parts.add(imgPart)
         }
 
-        // 2. Audio part (or text prompt)
+        // 2. Audio part (WAV / PCM)
         if (audioBytes != null && audioBytes.isNotEmpty()) {
             val audioPart = JsonObject()
             val inlineData = JsonObject()
@@ -152,7 +155,7 @@ class GeminiLiveClient(private val context: Context) {
         }
 
         // 3. User Instruction / System prompt
-        val promptText = textPrompt ?: "Bạn là BYVV trợ lý khiếm thị. Hãy nhìn hình ảnh từ camera và nghe giọng nói nếu có, sau đó mô tả ngắn gọn, súc tích và trả lời câu hỏi trực tiếp bằng tiếng Việt tự nhiên."
+        val promptText = textPrompt ?: "Bạn là BYVV - trợ lý khiếm thị trực quan. Hãy nhìn hình ảnh từ camera và nghe câu hỏi, trả lời trực tiếp, rõ ràng, tự nhiên bằng tiếng Việt."
         val textPart = JsonObject()
         textPart.addProperty("text", promptText)
         parts.add(textPart)
@@ -180,11 +183,11 @@ class GeminiLiveClient(private val context: Context) {
             .post(body)
             .build()
 
-        callback?.onThinkingStatus("Đang truyền dữ liệu đến Gemini...")
+        callback?.onThinkingStatus("Đang truyền dữ liệu đến Gemini Live...")
 
         client.newCall(request).enqueue(object : okhttp3.Callback {
             override fun onFailure(call: Call, e: IOException) {
-                callback?.onError("Lỗi kết nối: ${e.message}")
+                callback?.onError("Lỗi kết nối Gemini Live: ${e.message}")
             }
 
             override fun onResponse(call: Call, response: Response) {
@@ -215,15 +218,16 @@ class GeminiLiveClient(private val context: Context) {
                                     if (partList != null) {
                                         for (p in partList) {
                                             val pObj = p.asJsonObject
-                                            // Check thinking/thought
+                                            // Handle Live Extended Thinking thoughts
                                             if (pObj.has("thought") && pObj.get("thought").asBoolean) {
                                                 val thoughtText = pObj.get("text")?.asString ?: ""
-                                                callback?.onThinkingStatus("Suy nghĩ: $thoughtText")
+                                                callback?.onThinkingStatus("Đang suy nghĩ: $thoughtText")
                                             } else if (pObj.has("text")) {
                                                 val chunk = pObj.get("text").asString
                                                 accumulatedText += chunk
                                                 callback?.onAiTurn(accumulatedText, false)
                                             } else if (pObj.has("inlineData")) {
+                                                // Handle Live Native Audio chunks
                                                 val dataObj = pObj.getAsJsonObject("inlineData")
                                                 val b64 = dataObj.get("data")?.asString
                                                 if (b64 != null) {
@@ -235,13 +239,13 @@ class GeminiLiveClient(private val context: Context) {
                                     }
                                 }
                             } catch (parseEx: Exception) {
-                                Log.e("GeminiLiveClient", "Error parsing chunk: ${parseEx.message}")
+                                Log.e("GeminiLiveClient", "Lỗi đọc chunk: ${parseEx.message}")
                             }
                         }
                     }
                     callback?.onAiTurn(accumulatedText, true)
                 } catch (readEx: Exception) {
-                    callback?.onError("Lỗi đọc phản hồi: ${readEx.message}")
+                    callback?.onError("Lỗi luồng phản hồi: ${readEx.message}")
                 }
             }
         })

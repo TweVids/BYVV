@@ -9,14 +9,11 @@ object AppPreferences {
     private const val KEY_MODEL = "gemini_model"
     private const val KEY_THINKING_BUDGET = "gemini_thinking_budget"
 
-    // Gemini Live & Multimodal Models
+    // Gemini Live Models ONLY
     const val MODEL_GEMINI_3_8_LIVE = "gemini-3.8-live"
     const val MODEL_GEMINI_3_8_LIVE_EXTENDED = "gemini-3.8-live-extended-thinking"
     const val MODEL_GEMINI_3_1_LIVE_PREVIEW = "gemini-3.1-live-preview"
     const val MODEL_GEMINI_2_5_FLASH_NATIVE_AUDIO = "gemini-2.5-flash-native-audio-latest"
-    const val MODEL_GEMINI_3_5_TRANSCRIBE_LIVE = "gemini-3.5-transcribe-live"
-    const val MODEL_GEMINI_3_8_FLASH = "gemini-3.8-flash"
-    const val MODEL_GEMINI_3_5_FLASH = "gemini-3.5-flash"
     const val MODEL_CUSTOM = "Tự nhập model khác..."
 
     val AVAILABLE_MODELS = arrayOf(
@@ -24,9 +21,6 @@ object AppPreferences {
         MODEL_GEMINI_3_8_LIVE_EXTENDED,
         MODEL_GEMINI_3_1_LIVE_PREVIEW,
         MODEL_GEMINI_2_5_FLASH_NATIVE_AUDIO,
-        MODEL_GEMINI_3_5_TRANSCRIBE_LIVE,
-        MODEL_GEMINI_3_8_FLASH,
-        MODEL_GEMINI_3_5_FLASH,
         MODEL_CUSTOM
     )
 
@@ -45,7 +39,7 @@ object AppPreferences {
     }
 
     fun getModel(context: Context): String {
-        return getPrefs(context).getString(KEY_MODEL, MODEL_GEMINI_3_5_FLASH) ?: MODEL_GEMINI_3_5_FLASH
+        return getPrefs(context).getString(KEY_MODEL, MODEL_GEMINI_3_8_LIVE) ?: MODEL_GEMINI_3_8_LIVE
     }
 
     fun setModel(context: Context, model: String) {
