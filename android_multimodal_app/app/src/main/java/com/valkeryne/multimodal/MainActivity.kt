@@ -1,7 +1,12 @@
 package com.valkeryne.multimodal
 
 import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.widget.Button
@@ -29,6 +34,32 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private var tts: TextToSpeech? = null
     private lateinit var modelDir: File
 
+    private val downloadReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            intent?.let {
+                val status = it.getStringExtra(DownloadService.EXTRA_STATUS) ?: ""
+                val percent = it.getIntExtra(DownloadService.EXTRA_PERCENT, 0)
+                val hasSuccess = it.hasExtra(DownloadService.EXTRA_SUCCESS)
+
+                if (hasSuccess) {
+                    val success = it.getBooleanExtra(DownloadService.EXTRA_SUCCESS, false)
+                    if (success) {
+                        cameraStatusText.text = "Models ready - Tap to describe"
+                        aiTurnText.text = "Tải & kiểm tra mô hình thành công! Nhấn nút để bắt đầu."
+                        actionBtn.isEnabled = true
+                    } else {
+                        cameraStatusText.text = "Download incomplete. Retrying..."
+                        aiTurnText.text = "Mô hình tải chưa xong hoặc bị lỗi. Nhấn nút để thử lại."
+                        actionBtn.isEnabled = true
+                    }
+                } else if (status.isNotEmpty()) {
+                    cameraStatusText.text = status
+                    aiTurnText.text = status
+                }
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
@@ -44,55 +75,62 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         modelDir = getExternalFilesDir(null) ?: filesDir
         engine = ValkeryneMultimodalEngine(this, modelDir)
 
-        if (allPermissionsGranted()) {
-            startCamera()
-        } else {
-            ActivityCompat.requestPermissions(
-                this,
-                arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO),
-                101
-            )
-        }
-
-        // Check if models need to be downloaded
-        checkAndDownloadModels()
+        requestNeededPermissions()
 
         actionBtn.setOnClickListener {
-            runAccessibleInference()
+            if (!ModelDownloader.areModelsDownloadedAndValid(modelDir)) {
+                startBackgroundDownload()
+            } else {
+                runAccessibleInference()
+            }
         }
 
         viewFinder.setOnClickListener {
-            runAccessibleInference()
+            if (ModelDownloader.areModelsDownloadedAndValid(modelDir)) {
+                runAccessibleInference()
+            }
         }
     }
 
-    private fun checkAndDownloadModels() {
-        if (!ModelDownloader.areModelsDownloaded(modelDir)) {
-            actionBtn.isEnabled = false
-            cameraStatusText.text = "Checking and downloading AI models..."
-            aiTurnText.text = "Lần đầu khởi động: Đang tải mô hình ONNX từ Hugging Face..."
-
-            lifecycleScope.launch {
-                val success = ModelDownloader.downloadAllModels(modelDir) { _, _, status ->
-                    runOnUiThread {
-                        cameraStatusText.text = status
-                        aiTurnText.text = status
-                    }
-                }
-                if (success) {
-                    cameraStatusText.text = "Models ready - Tap to describe"
-                    aiTurnText.text = "Tải xong mô hình! Nhấn nút để bắt đầu."
-                    actionBtn.isEnabled = true
-                } else {
-                    cameraStatusText.text = "Download failed. Please check internet."
-                    aiTurnText.text = "Lỗi khi tải mô hình. Vui lòng kiểm tra kết nối mạng."
-                }
-            }
+    override fun onResume() {
+        super.onResume()
+        val filter = IntentFilter(DownloadService.BROADCAST_DOWNLOAD_PROGRESS)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(downloadReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
-            cameraStatusText.text = "Models ready - Tap to describe"
-            aiTurnText.text = "Đang chờ bạn gửi câu hỏi..."
-            actionBtn.isEnabled = true
+            registerReceiver(downloadReceiver, filter)
         }
+
+        checkModelStatus()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        try {
+            unregisterReceiver(downloadReceiver)
+        } catch (e: Exception) {}
+    }
+
+    private fun checkModelStatus() {
+        lifecycleScope.launch {
+            val valid = ModelDownloader.areModelsDownloadedAndValid(modelDir)
+            if (valid) {
+                cameraStatusText.text = "Models ready - Tap to describe"
+                aiTurnText.text = "Đang chờ bạn gửi câu hỏi..."
+                actionBtn.isEnabled = true
+                actionBtn.text = "CHỤP & HỎI (TAP TO ASK)"
+            } else {
+                cameraStatusText.text = "Models missing or corrupted. Downloading..."
+                aiTurnText.text = "Lần đầu khởi động: Đang tải & kiểm tra mô hình ONNX trong nền..."
+                actionBtn.text = "TẢI MÔ HÌNH (DOWNLOAD)"
+                startBackgroundDownload()
+            }
+        }
+    }
+
+    private fun startBackgroundDownload() {
+        actionBtn.isEnabled = false
+        DownloadService.start(this)
     }
 
     private fun startCamera() {
@@ -113,11 +151,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun runAccessibleInference() {
-        if (!ModelDownloader.areModelsDownloaded(modelDir)) {
-            checkAndDownloadModels()
-            return
-        }
-
         actionBtn.isEnabled = false
         userTurnText.text = "Đang lắng nghe & chụp hình ảnh..."
         aiTurnText.text = "Đang phân tích khung cảnh..."
@@ -171,11 +204,24 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         super.onDestroy()
     }
 
-    private fun allPermissionsGranted() = arrayOf(
-        Manifest.permission.CAMERA,
-        Manifest.permission.RECORD_AUDIO
-    ).all {
-        ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
+    private fun requestNeededPermissions() {
+        val permissions = mutableListOf(
+            Manifest.permission.CAMERA,
+            Manifest.permission.RECORD_AUDIO
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
+        val missing = permissions.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+
+        if (missing.isNotEmpty()) {
+            ActivityCompat.requestPermissions(this, missing.toTypedArray(), 101)
+        } else {
+            startCamera()
+        }
     }
 
     override fun onRequestPermissionsResult(
@@ -184,8 +230,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 101 && allPermissionsGranted()) {
-            startCamera()
+        if (requestCode == 101) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                startCamera()
+            }
         }
     }
 }
