@@ -1,16 +1,20 @@
 package com.valkeryne.multimodal
 
 import android.Manifest
-import android.content.BroadcastReceiver
+import android.annotation.SuppressLint
 import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.Build
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
+import android.view.MotionEvent
 import android.widget.Button
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
@@ -20,137 +24,280 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.Locale
 
 class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
-    private lateinit var engine: ValkeryneMultimodalEngine
     private lateinit var viewFinder: PreviewView
+    private lateinit var cameraStatusText: TextView
+    private lateinit var btnSettings: Button
     private lateinit var userTurnText: TextView
     private lateinit var aiTurnText: TextView
-    private lateinit var actionBtn: Button
-    private lateinit var cameraStatusText: TextView
+    private lateinit var holdToSpeakBtn: Button
+
     private var tts: TextToSpeech? = null
-    private lateinit var modelDir: File
+    private lateinit var geminiClient: GeminiLiveClient
 
-    private val downloadReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            intent?.let {
-                val status = it.getStringExtra(DownloadService.EXTRA_STATUS) ?: ""
-                val hasSuccess = it.hasExtra(DownloadService.EXTRA_SUCCESS)
+    private var audioRecord: AudioRecord? = null
+    private var isRecording = false
+    private var recordJob: Job? = null
+    private val audioBuffer = ByteArrayOutputStream()
 
-                if (hasSuccess) {
-                    val success = it.getBooleanExtra(DownloadService.EXTRA_SUCCESS, false)
-                    if (success) {
-                        cameraStatusText.text = "Models ready - Tap to describe"
-                        aiTurnText.text = "Tải & kiểm tra mô hình thành công! Nhấn nút để bắt đầu."
-                        actionBtn.isEnabled = true
-                        actionBtn.text = "CHỤP & HỎI (TAP TO ASK)"
-                    } else {
-                        cameraStatusText.text = "Download paused or incomplete"
-                        aiTurnText.text = "Nhấn nút để tiếp tục tải mô hình."
-                        actionBtn.isEnabled = true
-                        actionBtn.text = "TIẾP TỤC TẢI (RESUME)"
-                    }
-                } else if (status.isNotEmpty()) {
-                    cameraStatusText.text = status
-                    aiTurnText.text = status
-                }
-            }
-        }
-    }
+    private val sampleRate = 16000
+    private val channelConfig = AudioFormat.CHANNEL_IN_MONO
+    private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
 
+    @SuppressLint("ClickableViewAccessibility")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         viewFinder = findViewById(R.id.viewFinder)
+        cameraStatusText = findViewById(R.id.cameraStatusText)
+        btnSettings = findViewById(R.id.btnSettings)
         userTurnText = findViewById(R.id.userTurnText)
         aiTurnText = findViewById(R.id.aiTurnText)
-        actionBtn = findViewById(R.id.actionBtn)
-        cameraStatusText = findViewById(R.id.cameraStatusText)
+        holdToSpeakBtn = findViewById(R.id.holdToSpeakBtn)
 
         tts = TextToSpeech(this, this)
+        geminiClient = GeminiLiveClient(this)
 
-        modelDir = getExternalFilesDir(null) ?: filesDir
-        engine = ValkeryneMultimodalEngine(this, modelDir)
+        geminiClient.setCallback(object : GeminiLiveClient.Callback {
+            override fun onConnected() {
+                runOnUiThread {
+                    cameraStatusText.text = "Đã kết nối Gemini Live"
+                }
+            }
+
+            override fun onDisconnected(reason: String) {
+                runOnUiThread {
+                    cameraStatusText.text = "Ngắt kết nối: $reason"
+                }
+            }
+
+            override fun onUserTurn(text: String) {
+                runOnUiThread {
+                    userTurnText.text = text
+                }
+            }
+
+            override fun onAiTurn(text: String, isComplete: Boolean) {
+                runOnUiThread {
+                    aiTurnText.text = text
+                    if (isComplete && text.isNotBlank()) {
+                        cameraStatusText.text = "Hoàn tất - Giữ nút để hỏi tiếp"
+                        speakOut(text)
+                    }
+                }
+            }
+
+            override fun onThinkingStatus(text: String) {
+                runOnUiThread {
+                    cameraStatusText.text = text
+                }
+            }
+
+            override fun onError(error: String) {
+                runOnUiThread {
+                    aiTurnText.text = error
+                    cameraStatusText.text = "Lỗi xử lý"
+                    Toast.makeText(this@MainActivity, error, Toast.LENGTH_LONG).show()
+                }
+            }
+        })
+
+        btnSettings.setOnClickListener {
+            val dialog = SettingsDialog(this) {
+                updateStatusWithCurrentConfig()
+            }
+            dialog.show()
+        }
+
+        // Hold-to-speak button listener
+        holdToSpeakBtn.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    onHoldStart()
+                    true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    onHoldEnd()
+                    true
+                }
+                else -> false
+            }
+        }
 
         requestNeededPermissions()
+        updateStatusWithCurrentConfig()
+    }
 
-        val filter = IntentFilter(DownloadService.BROADCAST_DOWNLOAD_PROGRESS)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(downloadReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+    private fun updateStatusWithCurrentConfig() {
+        val key = AppPreferences.getApiKey(this)
+        val model = AppPreferences.getModel(this)
+        if (key.isBlank()) {
+            cameraStatusText.text = "Chưa có API Key! Nhấn ⚙ CÀI ĐẶT để thêm"
+            aiTurnText.text = "Vui lòng nhấn nút [⚙ CÀI ĐẶT] ở góc trên bên phải để cấu hình Gemini API Key."
         } else {
-            registerReceiver(downloadReceiver, filter)
-        }
-
-        checkModelStatus()
-
-        actionBtn.setOnClickListener {
-            lifecycleScope.launch {
-                val isReady = withContext(Dispatchers.IO) {
-                    ModelDownloader.areModelsDownloadedAndValid(modelDir)
-                }
-                if (!isReady) {
-                    startBackgroundDownload()
-                } else {
-                    runAccessibleInference()
-                }
-            }
-        }
-
-        viewFinder.setOnClickListener {
-            lifecycleScope.launch {
-                val isReady = withContext(Dispatchers.IO) {
-                    ModelDownloader.areModelsDownloadedAndValid(modelDir)
-                }
-                if (isReady) {
-                    runAccessibleInference()
-                }
-            }
+            cameraStatusText.text = "Mô hình: $model"
+            aiTurnText.text = "Sẵn sàng. Giữ nút màu vàng để nói & chụp ảnh."
         }
     }
 
-    override fun onDestroy() {
-        try {
-            unregisterReceiver(downloadReceiver)
-        } catch (e: Exception) {}
-        tts?.stop()
-        tts?.shutdown()
-        super.onDestroy()
-    }
-
-    private fun checkModelStatus() {
-        if (ModelDownloader.isDownloading()) {
-            cameraStatusText.text = "Downloading models in background..."
-            actionBtn.isEnabled = false
+    private fun onHoldStart() {
+        val apiKey = AppPreferences.getApiKey(this)
+        if (apiKey.isBlank()) {
+            Toast.makeText(this, "Vui lòng nhập API Key trong Cài Đặt!", Toast.LENGTH_SHORT).show()
+            val dialog = SettingsDialog(this) { updateStatusWithCurrentConfig() }
+            dialog.show()
             return
         }
 
-        lifecycleScope.launch(Dispatchers.IO) {
-            val valid = ModelDownloader.areModelsDownloadedAndValid(modelDir)
-            withContext(Dispatchers.Main) {
-                if (valid) {
-                    cameraStatusText.text = "Models ready - Tap to describe"
-                    aiTurnText.text = "Đang chờ bạn gửi câu hỏi..."
-                    actionBtn.isEnabled = true
-                    actionBtn.text = "CHỤP & HỎI (TAP TO ASK)"
-                } else {
-                    cameraStatusText.text = "Models missing. Downloading in queue..."
-                    aiTurnText.text = "Đang tải tuần tự các mô hình ONNX trong nền..."
-                    actionBtn.text = "ĐANG TẢI (DOWNLOADING...)"
-                    startBackgroundDownload()
+        holdToSpeakBtn.text = "🔴 ĐANG LẮNG NGHE... (THẢ ĐỂ GỬI)"
+        holdToSpeakBtn.backgroundTintList = ContextCompat.getColorStateList(this, android.R.color.holo_red_dark)
+        userTurnText.text = "Đang ghi âm giọng nói & chụp ảnh từ camera..."
+        aiTurnText.text = "Đang chuẩn bị gửi..."
+        cameraStatusText.text = "Đang lắng nghe..."
+
+        startRecordingAudio()
+    }
+
+    private fun onHoldEnd() {
+        if (!isRecording) return
+
+        holdToSpeakBtn.text = "🎤 GIỮ ĐỂ NÓI (HOLD TO SPEAK)"
+        holdToSpeakBtn.backgroundTintList = ContextCompat.getColorStateList(this, android.R.color.holo_orange_light)
+        cameraStatusText.text = "Đang gửi ảnh & âm thanh đến Gemini..."
+
+        stopRecordingAndSend()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startRecordingAudio() {
+        try {
+            val minBuf = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
+            audioRecord = AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                sampleRate,
+                channelConfig,
+                audioFormat,
+                minBuf * 2
+            )
+
+            audioBuffer.reset()
+            audioRecord?.startRecording()
+            isRecording = true
+
+            recordJob = lifecycleScope.launch(Dispatchers.IO) {
+                val buffer = ByteArray(1024)
+                while (isRecording && isActive) {
+                    val read = audioRecord?.read(buffer, 0, buffer.size) ?: 0
+                    if (read > 0) {
+                        synchronized(audioBuffer) {
+                            audioBuffer.write(buffer, 0, read)
+                        }
+                    }
                 }
             }
+        } catch (e: Exception) {
+            isRecording = false
+            Toast.makeText(this, "Lỗi ghi âm: ${e.message}", Toast.LENGTH_SHORT).show()
         }
     }
 
-    private fun startBackgroundDownload() {
-        actionBtn.isEnabled = false
-        DownloadService.start(this)
+    private fun stopRecordingAndSend() {
+        isRecording = false
+        try {
+            audioRecord?.stop()
+            audioRecord?.release()
+            audioRecord = null
+            recordJob?.cancel()
+        } catch (e: Exception) {}
+
+        lifecycleScope.launch {
+            val rawPcm = synchronized(audioBuffer) {
+                audioBuffer.toByteArray()
+            }
+            val wavBytes = if (rawPcm.isNotEmpty()) createWavFile(rawPcm, sampleRate) else null
+
+            // Capture current camera preview frame
+            val bitmap = viewFinder.bitmap
+            val imageBytes = bitmap?.let { bmp ->
+                val stream = ByteArrayOutputStream()
+                bmp.compress(Bitmap.CompressFormat.JPEG, 80, stream)
+                stream.toByteArray()
+            }
+
+            userTurnText.text = if (wavBytes != null) "Đã gửi âm thanh (${wavBytes.size / 1024} KB) + Ảnh camera" else "Đã gửi ảnh camera"
+            aiTurnText.text = "Gemini đang xử lý và phản hồi..."
+
+            geminiClient.sendMultimodalTurn(imageBytes, wavBytes)
+        }
+    }
+
+    private fun createWavFile(pcmData: ByteArray, sampleRate: Int): ByteArray {
+        val totalAudioLen = pcmData.size.toLong()
+        val totalDataLen = totalAudioLen + 36
+        val longSampleRate = sampleRate.toLong()
+        val channels = 1
+        val byteRate = 16 * sampleRate * channels / 8
+
+        val header = ByteArray(44)
+        header[0] = 'R'.code.toByte()
+        header[1] = 'I'.code.toByte()
+        header[2] = 'F'.code.toByte()
+        header[3] = 'F'.code.toByte()
+        header[4] = (totalDataLen and 0xff).toByte()
+        header[5] = (totalDataLen shr 8 and 0xff).toByte()
+        header[6] = (totalDataLen shr 16 and 0xff).toByte()
+        header[7] = (totalDataLen shr 24 and 0xff).toByte()
+        header[8] = 'W'.code.toByte()
+        header[9] = 'A'.code.toByte()
+        header[10] = 'V'.code.toByte()
+        header[11] = 'E'.code.toByte()
+        header[12] = 'f'.code.toByte()
+        header[13] = 'm'.code.toByte()
+        header[14] = 't'.code.toByte()
+        header[15] = ' '.code.toByte()
+        header[16] = 16
+        header[17] = 0
+        header[18] = 0
+        header[19] = 0
+        header[20] = 1 // PCM
+        header[21] = 0
+        header[22] = channels.toByte()
+        header[23] = 0
+        header[24] = (longSampleRate and 0xff).toByte()
+        header[25] = (longSampleRate shr 8 and 0xff).toByte()
+        header[26] = (longSampleRate shr 16 and 0xff).toByte()
+        header[27] = (longSampleRate shr 24 and 0xff).toByte()
+        header[28] = (byteRate and 0xff).toByte()
+        header[29] = (byteRate shr 8 and 0xff).toByte()
+        header[30] = (byteRate shr 16 and 0xff).toByte()
+        header[31] = (byteRate shr 24 and 0xff).toByte()
+        header[32] = (channels * 16 / 8).toByte()
+        header[33] = 0
+        header[34] = 16
+        header[35] = 0
+        header[36] = 'd'.code.toByte()
+        header[37] = 'a'.code.toByte()
+        header[38] = 't'.code.toByte()
+        header[39] = 'a'.code.toByte()
+        header[40] = (totalAudioLen and 0xff).toByte()
+        header[41] = (totalAudioLen shr 8 and 0xff).toByte()
+        header[42] = (totalAudioLen shr 16 and 0xff).toByte()
+        header[43] = (totalAudioLen shr 24 and 0xff).toByte()
+
+        val out = ByteArrayOutputStream()
+        out.write(header)
+        out.write(pcmData)
+        return out.toByteArray()
     }
 
     private fun startCamera() {
@@ -165,51 +312,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 cameraProvider.unbindAll()
                 cameraProvider.bindToLifecycle(this, cameraSelector, preview)
             } catch (exc: Exception) {
-                cameraStatusText.text = "Camera error: ${exc.message}"
+                cameraStatusText.text = "Camera lỗi: ${exc.message}"
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
-    private fun runAccessibleInference() {
-        actionBtn.isEnabled = false
-        userTurnText.text = "Đang lắng nghe & chụp hình ảnh..."
-        aiTurnText.text = "Đang phân tích khung cảnh..."
-
-        lifecycleScope.launch {
-            try {
-                val dummyAudio = File(modelDir, "user_prompt.wav")
-                val dummyPatches = FloatArray(256 * 1536)
-                val dummyGrid = longArrayOf(1, 16, 16)
-                val dummyTokens = LongArray(90) { 100L }
-
-                val (response, _) = engine.runMultimodalInference(
-                    dummyAudio,
-                    dummyPatches,
-                    dummyGrid,
-                    dummyTokens
-                ) { status ->
-                    runOnUiThread {
-                        cameraStatusText.text = status
-                    }
-                }
-
-                userTurnText.text = "Hãy miêu tả chi tiết hình ảnh này bằng tiếng Việt."
-                aiTurnText.text = response
-                cameraStatusText.text = "Đã hoàn thành"
-
-                speakOut(response)
-
-            } catch (e: Exception) {
-                aiTurnText.text = "Lỗi: ${e.message}"
-                cameraStatusText.text = "Lỗi thực thi"
-            } finally {
-                actionBtn.isEnabled = true
-            }
-        }
-    }
-
     private fun speakOut(text: String) {
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "ValkeryneResponse")
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "BYVVResponse")
     }
 
     override fun onInit(status: Int) {
@@ -223,14 +332,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             Manifest.permission.CAMERA,
             Manifest.permission.RECORD_AUDIO
         )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
-        }
-
         val missing = permissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
-
         if (missing.isNotEmpty()) {
             ActivityCompat.requestPermissions(this, missing.toTypedArray(), 101)
         } else {
@@ -249,5 +353,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 startCamera()
             }
         }
+    }
+
+    override fun onDestroy() {
+        geminiClient.release()
+        tts?.stop()
+        tts?.shutdown()
+        super.onDestroy()
     }
 }
