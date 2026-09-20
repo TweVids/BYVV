@@ -87,12 +87,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 }
             }
 
-            override fun onAiTurn(text: String, isComplete: Boolean) {
+            override fun onAiTurn(text: String, isComplete: Boolean, hasNativeAudio: Boolean) {
                 runOnUiThread {
                     aiTurnText.text = text
                     if (isComplete && text.isNotBlank()) {
                         cameraStatusText.text = "Hoàn tất - Giữ nút để hỏi tiếp"
-                        speakOut(text)
+                        if (!hasNativeAudio) {
+                            speakOut(text)
+                        }
                     }
                 }
             }
@@ -160,6 +162,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             dialog.show()
             return
         }
+
+        geminiClient.interrupt()
+        tts?.stop()
 
         holdToSpeakBtn.text = "🔴 ĐANG LẮNG NGHE... (THẢ ĐỂ DỪNG)"
         holdToSpeakBtn.backgroundTintList = ContextCompat.getColorStateList(this, android.R.color.holo_red_dark)

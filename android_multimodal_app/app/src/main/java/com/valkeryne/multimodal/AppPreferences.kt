@@ -9,22 +9,22 @@ object AppPreferences {
     private const val KEY_MODEL = "gemini_model"
     private const val KEY_THINKING_BUDGET = "gemini_thinking_budget"
 
-    // Gemini Live Models ONLY
+    // Verified Gemini Live Models (bidiGenerateContent supported)
     const val MODEL_GEMINI_3_8_LIVE = "gemini-3.8-live"
     const val MODEL_GEMINI_3_8_LIVE_EXTENDED = "gemini-3.8-live-extended-thinking"
-    const val MODEL_GEMINI_3_1_LIVE_PREVIEW = "gemini-3.1-live-preview"
+    const val MODEL_GEMINI_3_1_FLASH_LIVE_PREVIEW = "gemini-3.1-flash-live-preview"
     const val MODEL_GEMINI_2_5_FLASH_NATIVE_AUDIO = "gemini-2.5-flash-native-audio-latest"
     const val MODEL_CUSTOM = "Tự nhập model khác..."
 
     val AVAILABLE_MODELS = arrayOf(
         MODEL_GEMINI_3_8_LIVE,
         MODEL_GEMINI_3_8_LIVE_EXTENDED,
-        MODEL_GEMINI_3_1_LIVE_PREVIEW,
+        MODEL_GEMINI_3_1_FLASH_LIVE_PREVIEW,
         MODEL_GEMINI_2_5_FLASH_NATIVE_AUDIO,
         MODEL_CUSTOM
     )
 
-    val THINKING_EFFORT_OPTIONS = arrayOf("Off (0)", "Low (1024)", "Medium (4096)", "High (8192)")
+    val THINKING_EFFORT_OPTIONS = arrayOf("Off / Default (0)", "Low (1024 / LOW)", "Medium (4096 / MEDIUM)", "High (8192 / HIGH)")
 
     private fun getPrefs(context: Context): SharedPreferences {
         return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)

@@ -36,7 +36,7 @@ class GeminiLiveClient(private val context: Context) {
         fun onConnected()
         fun onDisconnected(reason: String)
         fun onUserTurn(text: String)
-        fun onAiTurn(text: String, isComplete: Boolean)
+        fun onAiTurn(text: String, isComplete: Boolean, hasNativeAudio: Boolean)
         fun onThinkingStatus(text: String)
         fun onError(error: String)
     }
@@ -47,6 +47,7 @@ class GeminiLiveClient(private val context: Context) {
         this.callback = cb
     }
 
+    @Synchronized
     private fun initAudioTrack() {
         if (audioTrack == null) {
             val sampleRate = 24000 // Gemini Live outputs 24kHz PCM mono 16-bit
@@ -83,6 +84,13 @@ class GeminiLiveClient(private val context: Context) {
         } catch (e: Exception) {
             Log.e("GeminiLiveClient", "Error playing PCM audio: ${e.message}")
         }
+    }
+
+    private fun stopPcmAudio() {
+        try {
+            audioTrack?.pause()
+            audioTrack?.flush()
+        } catch (e: Exception) {}
     }
 
     /**
@@ -122,39 +130,53 @@ class GeminiLiveClient(private val context: Context) {
         val wsUrl = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey"
         val request = Request.Builder().url(wsUrl).build()
 
-        callback?.onThinkingStatus("Đang kết nối WebSocket Gemini Live...")
+        callback?.onThinkingStatus("Đang kết nối WebSocket Gemini Live ($model)...")
 
         liveWebSocket = client.newWebSocket(request, object : WebSocketListener() {
             var currentTurnText = ""
+            var hasReceivedNativeAudioInTurn = false
 
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 isConnected = true
                 callback?.onConnected()
                 callback?.onThinkingStatus("Đã kết nối! Đang gửi Setup cấu hình...")
 
-                // Send BidiGenerateContentSetup message
-                // Format per Google docs: setup.model, setup.generationConfig.responseModalities,
-                // setup.systemInstruction
+                // Construct BidiGenerateContentSetup message
                 val setupRoot = JsonObject()
                 val setupObj = JsonObject()
                 setupObj.addProperty("model", "models/$model")
 
                 val genConfig = JsonObject()
                 val modalities = JsonArray()
+                // Live models strictly require responseModalities = ["AUDIO"]
                 modalities.add("AUDIO")
                 genConfig.add("responseModalities", modalities)
 
-                if (thinkingBudget > 0) {
+                // Model-specific thinking configuration verified against API:
+                if (model.contains("extended-thinking")) {
+                    // gemini-3.8-live-extended-thinking REQUIRES thinkingLevel: "LOW", "MEDIUM", or "HIGH"
+                    val level = when {
+                        thinkingBudget >= 8192 -> "HIGH"
+                        thinkingBudget >= 4096 -> "MEDIUM"
+                        else -> "LOW"
+                    }
+                    val thinkingConfig = JsonObject()
+                    thinkingConfig.addProperty("thinkingLevel", level)
+                    genConfig.add("thinkingConfig", thinkingConfig)
+                } else if (model.contains("2.5") && thinkingBudget > 0) {
+                    // gemini-2.5-flash-native-audio supports thinkingBudget
                     val thinkingConfig = JsonObject()
                     thinkingConfig.addProperty("thinkingBudget", thinkingBudget)
                     genConfig.add("thinkingConfig", thinkingConfig)
                 }
+                // Note: gemini-3.8-live and gemini-3.1-flash-live-preview reject thinkingConfig, so do not include
+
                 setupObj.add("generationConfig", genConfig)
 
                 val sysInstruction = JsonObject()
                 val sysParts = JsonArray()
                 val sysPart = JsonObject()
-                sysPart.addProperty("text", "Bạn là BYVV - trợ lý trực quan cho người khiếm thị. Hãy nhìn camera và lắng nghe người dùng, trả lời súc tích, tự nhiên bằng tiếng Việt.")
+                sysPart.addProperty("text", "Bạn là BYVV - trợ lý trực quan cho người khiếm thị. Hãy nhìn hình ảnh camera và lắng nghe người dùng, trả lời súc tích, tự nhiên, bằng tiếng Việt.")
                 sysParts.add(sysPart)
                 sysInstruction.add("parts", sysParts)
                 setupObj.add("systemInstruction", sysInstruction)
@@ -167,7 +189,7 @@ class GeminiLiveClient(private val context: Context) {
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                Log.d("GeminiLiveClient", "Received message: ${text.take(500)}")
+                Log.d("GeminiLiveClient", "Received message: ${text.take(300)}")
                 try {
                     val root = gson.fromJson(text, JsonObject::class.java)
 
@@ -183,45 +205,46 @@ class GeminiLiveClient(private val context: Context) {
                     if (root.has("serverContent")) {
                         val serverContent = root.getAsJsonObject("serverContent")
 
-                        // Handle input transcription (what the user said)
+                        // Handle user speech transcription
                         if (serverContent.has("inputTranscription")) {
                             val inputTranscription = serverContent.getAsJsonObject("inputTranscription")
-                            val transcribedText = inputTranscription.get("text")?.asString ?: ""
-                            if (transcribedText.isNotBlank()) {
-                                callback?.onUserTurn(transcribedText)
+                            val transcribed = inputTranscription.get("text")?.asString ?: ""
+                            if (transcribed.isNotBlank()) {
+                                callback?.onUserTurn(transcribed)
                             }
                         }
 
-                        // Handle output transcription (what Gemini said)
+                        // Handle model speech transcription
                         if (serverContent.has("outputTranscription")) {
                             val outputTranscription = serverContent.getAsJsonObject("outputTranscription")
-                            val transcribedText = outputTranscription.get("text")?.asString ?: ""
-                            if (transcribedText.isNotBlank()) {
-                                currentTurnText += transcribedText
-                                callback?.onAiTurn(currentTurnText, false)
+                            val transcribed = outputTranscription.get("text")?.asString ?: ""
+                            if (transcribed.isNotBlank()) {
+                                currentTurnText += transcribed
+                                callback?.onAiTurn(currentTurnText, false, hasReceivedNativeAudioInTurn)
                             }
                         }
 
+                        // Handle model turn parts
                         if (serverContent.has("modelTurn")) {
                             val modelTurn = serverContent.getAsJsonObject("modelTurn")
                             val parts = modelTurn.getAsJsonArray("parts")
                             if (parts != null) {
                                 for (p in parts) {
                                     val pObj = p.asJsonObject
-                                    // Extended thinking
+                                    // Extended thinking text
                                     if (pObj.has("thought") && pObj.get("thought").asBoolean) {
                                         val thought = pObj.get("text")?.asString ?: ""
                                         callback?.onThinkingStatus("Đang nghĩ: $thought")
                                     } else if (pObj.has("text")) {
-                                        // Text stream
                                         val chunk = pObj.get("text").asString
                                         currentTurnText += chunk
-                                        callback?.onAiTurn(currentTurnText, false)
+                                        callback?.onAiTurn(currentTurnText, false, hasReceivedNativeAudioInTurn)
                                     } else if (pObj.has("inlineData")) {
                                         // Live PCM audio stream (24kHz 16-bit mono)
                                         val dataObj = pObj.getAsJsonObject("inlineData")
                                         val b64 = dataObj.get("data")?.asString
-                                        if (b64 != null) {
+                                        if (!b64.isNullOrEmpty()) {
+                                            hasReceivedNativeAudioInTurn = true
                                             val pcmBytes = Base64.decode(b64, Base64.DEFAULT)
                                             playPcmChunk(pcmBytes)
                                         }
@@ -233,8 +256,10 @@ class GeminiLiveClient(private val context: Context) {
                         // Check turn complete
                         if (serverContent.has("turnComplete") && serverContent.get("turnComplete").asBoolean) {
                             val finishedText = currentTurnText
+                            val hadAudio = hasReceivedNativeAudioInTurn
                             currentTurnText = ""
-                            callback?.onAiTurn(finishedText, true)
+                            hasReceivedNativeAudioInTurn = false
+                            callback?.onAiTurn(finishedText, true, hadAudio)
                         }
                     }
                 } catch (e: Exception) {
@@ -261,7 +286,7 @@ class GeminiLiveClient(private val context: Context) {
 
     /**
      * Send camera image frame in real-time over WebSocket
-     * Per Google docs: {"realtimeInput": {"video": {"data": "base64...", "mimeType": "image/jpeg"}}}
+     * Format: {"realtimeInput": {"video": {"data": "base64...", "mimeType": "image/jpeg"}}}
      */
     fun sendCameraFrame(imageBytes: ByteArray) {
         val ws = liveWebSocket ?: return
@@ -284,7 +309,7 @@ class GeminiLiveClient(private val context: Context) {
 
     /**
      * Stream real-time microphone PCM audio chunk (16kHz 16-bit little endian)
-     * Per Google docs: {"realtimeInput": {"audio": {"data": "base64...", "mimeType": "audio/pcm;rate=16000"}}}
+     * Format: {"realtimeInput": {"audio": {"data": "base64...", "mimeType": "audio/pcm;rate=16000"}}}
      */
     fun sendRealtimeAudioChunk(pcmChunk: ByteArray) {
         val ws = liveWebSocket ?: return
@@ -302,8 +327,8 @@ class GeminiLiveClient(private val context: Context) {
     }
 
     /**
-     * Notify Gemini that user has finished speaking.
-     * Per Google docs: {"clientContent": {"turns": [{"role": "user", "parts": []}], "turnComplete": true}}
+     * Notify Gemini that user has finished speaking and trigger response.
+     * Format: {"clientContent": {"turns": [{"role": "user", "parts": []}], "turnComplete": true}}
      */
     fun finishUserTurn() {
         val ws = liveWebSocket ?: return
@@ -326,6 +351,10 @@ class GeminiLiveClient(private val context: Context) {
             ws.send(json)
             callback?.onThinkingStatus("Đang chờ Gemini phản hồi...")
         }
+    }
+
+    fun interrupt() {
+        stopPcmAudio()
     }
 
     fun release() {
