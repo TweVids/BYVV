@@ -9,23 +9,25 @@ object AppPreferences {
     private const val KEY_MODEL = "gemini_model"
     private const val KEY_THINKING_BUDGET = "gemini_thinking_budget"
 
-    // Exact Supported Models verified with API key
+    // Gemini Live & Multimodal Models
+    const val MODEL_GEMINI_3_8_LIVE = "gemini-3.8-live"
+    const val MODEL_GEMINI_3_8_LIVE_EXTENDED = "gemini-3.8-live-extended-thinking"
+    const val MODEL_GEMINI_3_1_LIVE_PREVIEW = "gemini-3.1-live-preview"
     const val MODEL_GEMINI_2_5_FLASH_NATIVE_AUDIO = "gemini-2.5-flash-native-audio-latest"
     const val MODEL_GEMINI_3_5_TRANSCRIBE_LIVE = "gemini-3.5-transcribe-live"
-    const val MODEL_GEMINI_3_5_FLASH = "gemini-3.5-flash"
     const val MODEL_GEMINI_3_8_FLASH = "gemini-3.8-flash"
-    const val MODEL_GEMINI_3_6_FLASH = "gemini-3.6-flash"
-    const val MODEL_GEMINI_3_1_FLASH_LITE = "gemini-3.1-flash-lite"
-    const val MODEL_GEMINI_FLASH_LATEST = "gemini-flash-latest"
+    const val MODEL_GEMINI_3_5_FLASH = "gemini-3.5-flash"
+    const val MODEL_CUSTOM = "Tự nhập model khác..."
 
     val AVAILABLE_MODELS = arrayOf(
+        MODEL_GEMINI_3_8_LIVE,
+        MODEL_GEMINI_3_8_LIVE_EXTENDED,
+        MODEL_GEMINI_3_1_LIVE_PREVIEW,
         MODEL_GEMINI_2_5_FLASH_NATIVE_AUDIO,
         MODEL_GEMINI_3_5_TRANSCRIBE_LIVE,
-        MODEL_GEMINI_3_5_FLASH,
         MODEL_GEMINI_3_8_FLASH,
-        MODEL_GEMINI_3_6_FLASH,
-        MODEL_GEMINI_3_1_FLASH_LITE,
-        MODEL_GEMINI_FLASH_LATEST
+        MODEL_GEMINI_3_5_FLASH,
+        MODEL_CUSTOM
     )
 
     val THINKING_EFFORT_OPTIONS = arrayOf("Off (0)", "Low (1024)", "Medium (4096)", "High (8192)")

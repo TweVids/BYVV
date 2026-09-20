@@ -3,6 +3,7 @@ package com.valkeryne.multimodal
 import android.app.Dialog
 import android.content.Context
 import android.os.Bundle
+import android.view.View
 import android.view.ViewGroup
 import android.view.Window
 import android.widget.*
@@ -55,12 +56,22 @@ class SettingsDialog(context: Context, private val onSaved: () -> Unit) : Dialog
 
         // Model Selector Label
         val modelLabel = TextView(context).apply {
-            text = "Chọn Mô Hình (Gemini Live / Flash):"
+            text = "Chọn Mô Hình (Gemini Live Models):"
             textSize = 14f
             setTextColor(0xFFBBBBBB.toInt())
             setPadding(0, 24, 0, 8)
         }
         layout.addView(modelLabel)
+
+        // Custom Model Input field (hidden unless selected)
+        val customModelInput = EditText(context).apply {
+            hint = "Nhập tên model (vd: gemini-3.8-live)"
+            setHintTextColor(0xFF777777.toInt())
+            setTextColor(0xFFFFFFFF.toInt())
+            visibility = View.GONE
+            setBackgroundColor(0xFF2C2C2C.toInt())
+            setPadding(20, 20, 20, 20)
+        }
 
         // Model Spinner
         val modelSpinner = Spinner(context).apply {
@@ -72,9 +83,27 @@ class SettingsDialog(context: Context, private val onSaved: () -> Unit) : Dialog
             this.adapter = adapter
             val currentModel = AppPreferences.getModel(context)
             val index = AppPreferences.AVAILABLE_MODELS.indexOf(currentModel)
-            if (index >= 0) setSelection(index)
+            if (index >= 0) {
+                setSelection(index)
+            } else {
+                setSelection(AppPreferences.AVAILABLE_MODELS.lastIndex)
+                customModelInput.setText(currentModel)
+                customModelInput.visibility = View.VISIBLE
+            }
+
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                    if (position == AppPreferences.AVAILABLE_MODELS.lastIndex) {
+                        customModelInput.visibility = View.VISIBLE
+                    } else {
+                        customModelInput.visibility = View.GONE
+                    }
+                }
+                override fun onNothingSelected(parent: AdapterView<*>?) {}
+            }
         }
         layout.addView(modelSpinner)
+        layout.addView(customModelInput)
 
         // Thinking Effort Label
         val thinkingLabel = TextView(context).apply {
@@ -128,7 +157,13 @@ class SettingsDialog(context: Context, private val onSaved: () -> Unit) : Dialog
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             setOnClickListener {
                 val key = apiKeyInput.text.toString().trim()
-                val selectedModel = modelSpinner.selectedItem.toString()
+                val selectedModel = if (modelSpinner.selectedItemPosition == AppPreferences.AVAILABLE_MODELS.lastIndex) {
+                    val custom = customModelInput.text.toString().trim()
+                    if (custom.isNotEmpty()) custom else AppPreferences.MODEL_GEMINI_3_8_LIVE
+                } else {
+                    modelSpinner.selectedItem.toString()
+                }
+
                 val budget = when (thinkingSpinner.selectedItemPosition) {
                     1 -> 1024
                     2 -> 4096
